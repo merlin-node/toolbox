@@ -257,17 +257,25 @@ sys_info_ports() {
                 if [[ -z "$out" ]]; then
                     warn "未发现监听端口"
                 else
-                    printf "  %-6s %-34s %s\n" "协议" "监听地址:端口" "进程"
+                    printf "  %-6s %-34s %-18s %s\n" "协议" "监听地址:端口" "进程" "PID"
                     echo "$out" | awk '
                         {
                             proto=$1;
                             local_addr=$5;
-                            proc="";
-                            for (i=7; i<=NF; i++) proc=proc $i " ";
+                            raw="";
+                            for (i=7; i<=NF; i++) raw=raw $i " ";
+                            proc=raw;
+                            pid=raw;
                             gsub(/^users:\(\(\"/, "", proc);
                             gsub(/\".*$/, "", proc);
                             if (proc == "") proc="-";
-                            printf "  %-6s %-34s %s\n", proto, local_addr, proc;
+                            if (pid ~ /pid=/) {
+                                sub(/^.*pid=/, "", pid);
+                                sub(/,.*/, "", pid);
+                            } else {
+                                pid="-";
+                            }
+                            printf "  %-6s %-34s %-18s %s\n", proto, local_addr, proc, pid;
                         }
                     '
                 fi
@@ -292,17 +300,25 @@ sys_info_ports() {
                 if [[ -z "$line" ]]; then
                     warn "端口 $port 当前未被监听"
                 else
-                    printf "  %-6s %-34s %s\n" "协议" "监听地址:端口" "进程"
+                    printf "  %-6s %-34s %-18s %s\n" "协议" "监听地址:端口" "进程" "PID"
                     echo "$line" | awk '
                         {
                             proto=$1;
                             local_addr=$5;
-                            proc="";
-                            for (i=7; i<=NF; i++) proc=proc $i " ";
+                            raw="";
+                            for (i=7; i<=NF; i++) raw=raw $i " ";
+                            proc=raw;
+                            pid=raw;
                             gsub(/^users:\(\(\"/, "", proc);
                             gsub(/\".*$/, "", proc);
                             if (proc == "") proc="-";
-                            printf "  %-6s %-34s %s\n", proto, local_addr, proc;
+                            if (pid ~ /pid=/) {
+                                sub(/^.*pid=/, "", pid);
+                                sub(/,.*/, "", pid);
+                            } else {
+                                pid="-";
+                            }
+                            printf "  %-6s %-34s %-18s %s\n", proto, local_addr, proc, pid;
                         }
                     '
                 fi

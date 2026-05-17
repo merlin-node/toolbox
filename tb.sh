@@ -1976,7 +1976,7 @@ do_uninstall() {
 }
 
 # =============================================================================
-# 10. DNS 管理
+# 9. DNS 管理
 # =============================================================================
 DNS_BACKUP_DIR="/var/backups/tb/dns"
 DNS_RESOLVED_DROPIN="/etc/systemd/resolved.conf.d/tb-dns.conf"
@@ -2063,23 +2063,37 @@ dns_backup_config() {
 dns_show_config() {
     clear; show_banner
     sec "DNS 配置"
-    echo -e "${CYAN}/etc/resolv.conf:${NC}"
-    if [[ -e /etc/resolv.conf ]]; then
-        ls -l /etc/resolv.conf 2>/dev/null || true
-        echo
-        cat /etc/resolv.conf
+
+    local mgr cur_v4 cur_v6 search_domain link_info
+    cur_v4=$(dns_current_v4)
+    cur_v6=$(dns_current_v6)
+    search_domain=$(awk '/^[[:space:]]*(search|domain)[[:space:]]+/ {$1=""; sub(/^[[:space:]]+/, ""); print}' /etc/resolv.conf 2>/dev/null | xargs echo)
+
+    if dns_using_systemd_resolved; then
+        mgr="systemd-resolved"
+    elif [[ -L /etc/resolv.conf ]]; then
+        mgr="resolv.conf symlink"
     else
-        warn "/etc/resolv.conf 不存在"
+        mgr="static resolv.conf"
     fi
-    echo
-    echo -e "${CYAN}当前解析服务器:${NC}"
-    local cur
-    cur=$(dns_current_servers | xargs echo)
-    [[ -n "$cur" ]] && echo "  $cur" || echo "  未检测到非本地 DNS"
+
+    echo -e "${CYAN}当前 DNS:${NC}"
+    echo -e "  IPv4: ${cur_v4:-无}"
+    echo -e "  IPv6: ${cur_v6:-无}"
+    echo -e "  搜索域: ${search_domain:-无}"
+    echo -e "  管理方式: $mgr"
+
+    if [[ -e /etc/resolv.conf ]]; then
+        echo
+        echo -e "${CYAN}/etc/resolv.conf:${NC} $(readlink -f /etc/resolv.conf 2>/dev/null || echo /etc/resolv.conf)"
+        grep -E '^[[:space:]]*(nameserver|search|domain)[[:space:]]+' /etc/resolv.conf 2>/dev/null | sed 's/^/  /' || true
+    fi
+
     if command -v resolvectl >/dev/null 2>&1; then
         echo
-        echo -e "${CYAN}systemd-resolved 状态:${NC}"
-        resolvectl status --no-pager 2>/dev/null | sed -n '1,80p' || true
+        echo -e "${CYAN}resolvectl 摘要:${NC}"
+        resolvectl dns 2>/dev/null | sed 's/^/  /' || true
+        resolvectl domain 2>/dev/null | sed 's/^/  /' || true
     fi
     pause
 }
@@ -2273,9 +2287,9 @@ main_menu() {
         echo
         echo "  8. 系统工具 (SSH / DD)"
         echo
-        echo "  9. 脚本管理"
+        echo "  9. DNS 管理"
         echo
-        echo "  10. DNS 管理"
+        echo "  10. 脚本管理"
         echo
         echo "  0. 退出"
         echo
@@ -2291,8 +2305,8 @@ main_menu() {
             6) menu_docker ;;
             7) menu_nettest ;;
             8) menu_systools ;;
-            9) menu_script ;;
-            10) menu_dns ;;
+            9) menu_dns ;;
+            10) menu_script ;;
             0|"") clear; exit 0 ;;
             *) err "无效"; sleep 1 ;;
         esac

@@ -3,7 +3,7 @@
 # Toolbox Script v1.0 By Merlin
 # VPS 常用工具箱 (Debian 12/13)
 # 调用:    tb
-# 安装:    curl -fsSL -o tb https://raw.githubusercontent.com/merlin-node/toolbox/main/tb.sh && chmod +x tb && sudo mv tb /usr/local/bin/tb
+# 安装:    curl -fsSL -o tb https://raw.githubusercontent.com/merlin-node/toolbox/main/tb.sh && chmod +x tb && mv tb /usr/local/bin/tb
 # =============================================================================
 
 set -o pipefail

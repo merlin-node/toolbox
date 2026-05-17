@@ -5,10 +5,15 @@ VPS 常用工具箱，命令 `tb` 一键呼出菜单。Debian 12/13。
 ## 安装
 
 ```bash
-curl -fsSL -o tb https://raw.githubusercontent.com/merlin-node/toolbox/main/tb.sh && chmod +x tb && sudo mv tb /usr/local/bin/tb
+curl -fsSL -o tb https://raw.githubusercontent.com/merlin-node/toolbox/main/tb.sh && chmod +x tb && mv tb /usr/local/bin/tb
 ```
 
 之后输入 `tb` 即可。
+
+> 上面的命令默认以 root 身份执行。如果你用的是普通用户：
+> ```bash
+> curl -fsSL -o tb https://raw.githubusercontent.com/merlin-node/toolbox/main/tb.sh && chmod +x tb && sudo mv tb /usr/local/bin/tb
+> ```
 
 > **DD 后的裸系统没有 curl 也没有 wget？** 先装一下：
 > ```bash

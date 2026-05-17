@@ -2208,7 +2208,7 @@ dns_restore_config() {
 dns_test_resolve() {
     clear; show_banner
     sec "测试 DNS 解析"
-    local domain cur_v4 cur_v6 result_v4 result_v6
+    local domain cur_v4 cur_v6 result_v4 result_v6 ip
     read -rp "请输入测试域名 [google.com]: " domain
     domain="${domain:-google.com}"
 
@@ -2220,12 +2220,25 @@ dns_test_resolve() {
     echo
 
     if [[ -n "$cur_v4" ]]; then
-        if command -v dig >/dev/null 2>&1; then
-            result_v4=$(dig +short A "$domain" 2>/dev/null | awk '/^([0-9]{1,3}\.){3}[0-9]{1,3}$/ {print}' | head -n 3 | xargs echo)
-        else
-            result_v4=$(getent ahostsv4 "$domain" 2>/dev/null | awk '{print $1}' | awk '!seen[$0]++' | head -n 3 | xargs echo)
+        result_v4=""
+
+        # 优先使用系统解析结果，避免 dig/正则差异造成误判
+        while read -r ip _; do
+            if is_ipv4_addr "$ip"; then
+                [[ " $result_v4 " == *" $ip "* ]] || result_v4="$result_v4 $ip"
+            fi
+        done < <(getent ahostsv4 "$domain" 2>/dev/null || true)
+
+        # getent 没结果时，再用 dig A 兜底
+        if [[ -z "$(echo "$result_v4" | xargs echo)" ]] && command -v dig >/dev/null 2>&1; then
+            while read -r ip; do
+                if is_ipv4_addr "$ip"; then
+                    [[ " $result_v4 " == *" $ip "* ]] || result_v4="$result_v4 $ip"
+                fi
+            done < <(dig +short A "$domain" 2>/dev/null || true)
         fi
 
+        result_v4=$(echo "$result_v4" | xargs echo | awk '{print $1, $2, $3}' | xargs echo)
         if [[ -n "$result_v4" ]]; then
             ok "IPv4 解析：成功"
             echo -e "  结果: $result_v4"
@@ -2239,12 +2252,25 @@ dns_test_resolve() {
     echo
 
     if [[ -n "$cur_v6" ]]; then
-        if command -v dig >/dev/null 2>&1; then
-            result_v6=$(dig +short AAAA "$domain" 2>/dev/null | awk '/:/ {print}' | head -n 3 | xargs echo)
-        else
-            result_v6=$(getent ahostsv6 "$domain" 2>/dev/null | awk '{print $1}' | awk '/:/ && !seen[$0]++' | head -n 3 | xargs echo)
+        result_v6=""
+
+        # 优先使用系统解析结果
+        while read -r ip _; do
+            if is_ipv6_addr "$ip"; then
+                [[ " $result_v6 " == *" $ip "* ]] || result_v6="$result_v6 $ip"
+            fi
+        done < <(getent ahostsv6 "$domain" 2>/dev/null || true)
+
+        # getent 没结果时，再用 dig AAAA 兜底
+        if [[ -z "$(echo "$result_v6" | xargs echo)" ]] && command -v dig >/dev/null 2>&1; then
+            while read -r ip; do
+                if is_ipv6_addr "$ip"; then
+                    [[ " $result_v6 " == *" $ip "* ]] || result_v6="$result_v6 $ip"
+                fi
+            done < <(dig +short AAAA "$domain" 2>/dev/null || true)
         fi
 
+        result_v6=$(echo "$result_v6" | xargs echo | awk '{print $1, $2, $3}' | xargs echo)
         if [[ -n "$result_v6" ]]; then
             ok "IPv6 解析：成功"
             echo -e "  结果: $result_v6"

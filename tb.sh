@@ -3,7 +3,7 @@
 # Toolbox Script v1.0 By Merlin
 # VPS 常用工具箱 (Debian 12/13)
 # 调用:    tb
-# 安装:    wget -O tb https://raw.githubusercontent.com/merlin-node/toolbox/main/tb.sh && chmod +x tb && sudo mv tb /usr/local/bin/tb
+# 安装:    curl -fsSL -o tb https://raw.githubusercontent.com/merlin-node/toolbox/main/tb.sh && chmod +x tb && sudo mv tb /usr/local/bin/tb
 # =============================================================================
 
 set -o pipefail
@@ -2048,17 +2048,19 @@ menu_dd() {
         *) err "无效"; sleep 1; return ;;
     esac
 
-    # 询问密码（必填，两次核对）
+    # 询问密码（必填，隐藏输入，两次核对）
     echo
-    echo -e "  ${CYAN}新 root 密码${NC}（必填）"
+    echo -e "  ${CYAN}新 root 密码${NC}（必填，输入时不显示）"
     local newpw pw2
     while :; do
-        read -rp "  密码: " newpw
+        read -rsp "  密码: " newpw
+        echo
         if [[ -z "$newpw" ]]; then
             err "密码不能为空"
             continue
         fi
-        read -rp "  再输一次: " pw2
+        read -rsp "  再输一次: " pw2
+        echo
         if [[ "$newpw" == "$pw2" ]]; then
             break
         fi
@@ -2082,11 +2084,14 @@ menu_dd() {
         break
     done
 
-    # 最终确认
+    # 最终确认（密码用星号显示，不打印明文）
+    local pw_mask pw_len
+    pw_len=${#newpw}
+    pw_mask=$(printf '%*s' "$pw_len" '' | tr ' ' '*')
     echo
     hr
-    echo -e "  即将重装为: ${BOLD}${sys}${NC}"
-    echo -e "  新 root 密码: ${BOLD}${newpw}${NC}"
+    echo -e "  即将重装为:   ${BOLD}${sys}${NC}"
+    echo -e "  新 root 密码: ${BOLD}${pw_mask}${NC} (${pw_len} 位)"
     echo -e "  新 SSH 端口:  ${BOLD}${newport}${NC}"
     hr
     confirm "确认开始 DD 重装？" N || { warn "已取消"; return; }
@@ -2097,14 +2102,32 @@ menu_dd() {
         || wget -O reinstall.sh https://raw.githubusercontent.com/bin456789/reinstall/main/reinstall.sh
     chmod +x reinstall.sh
 
-    msg "执行 DD 重装..."
-    warn "完成后 VPS 会自动重启，重启时 SSH 会断开"
-    warn "请等待 5-15 分钟，然后用新密码 + 端口 ${newport} 尝试重连"
-    sleep 3
+    msg "配置 reinstall（这一步不会真正写盘，只是设置引导项）..."
+    sleep 2
     bash reinstall.sh $sys --password "$newpw" --ssh-port "$newport"
+    local rc=$?
     echo
-    msg "reinstall 已配置完成，请按提示重启系统开始重装"
-    pause
+    if (( rc != 0 )); then
+        err "reinstall 配置失败，请检查上方输出"
+        pause
+        return
+    fi
+
+    hr
+    ok "reinstall 已配置完成"
+    echo
+    warn "重要：${BOLD}现在系统还没有真正 DD${NC}"
+    warn "只有重启后，机器会从安装介质引导，那一刻才开始擦盘重装"
+    warn "重启后 5-15 分钟内不要操作，等装完用新端口 ${newport} 重连"
+    echo
+    if confirm "现在立即重启开始 DD？" N; then
+        msg "3 秒后重启..."
+        sleep 3
+        reboot
+    else
+        warn "已取消重启。需要时手动执行: ${BOLD}reboot${NC}"
+        pause
+    fi
 }
 
 # =============================================================================

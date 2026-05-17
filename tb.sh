@@ -153,16 +153,18 @@ menu_system() {
         echo "  3) 实时进程监控 (Top 10)"
         echo "  4) 可疑进程检测 (防挖矿)"
         echo "  5) htop 交互监控"
+        echo "  6) 查看端口占用"
+        echo "  7) 结束指定进程"
         echo
         echo -e "  ${BOLD}── 基础配置 ──${NC}"
-        echo "  6) 时区设置          当前: $(timedatectl 2>/dev/null | awk '/Time zone/{print $3}')"
-        echo "  7) hostname 修改     当前: $(hostname)"
-        echo "  8) 添加 sudo 用户"
+        echo "  8) 时区设置          当前: $(timedatectl 2>/dev/null | awk '/Time zone/{print $3}')"
+        echo "  9) hostname 修改     当前: $(hostname)"
+        echo "  10) 添加 sudo 用户"
         echo
         echo "  0) 返回上一页"
         hr
         local c
-        read -rp "$(echo -e "${CYAN}请选择 [0-8]: ${NC}")" c
+        read -rp "$(echo -e "${CYAN}请选择 [0-10]: ${NC}")" c
         case "$c" in
             1) sys_update_clean ;;
             2) sys_info_overview; pause ;;
@@ -176,9 +178,11 @@ menu_system() {
                     sleep 2
                 fi
                 ;;
-            6) cfg_timezone; pause ;;
-            7) cfg_hostname; pause ;;
-            8) cfg_adduser; pause ;;
+            6) sys_info_ports ;;
+            7) sys_kill_process ;;
+            8) cfg_timezone; pause ;;
+            9) cfg_hostname; pause ;;
+            10) cfg_adduser; pause ;;
             0|"") return ;;
             *) err "无效"; sleep 1 ;;
         esac
@@ -224,6 +228,178 @@ sys_info_top() {
     echo -e "  ${CYAN}内存占用 Top 10:${NC}"
     ps aux --sort=-%mem | head -11 | awk 'NR==1 {printf "    %-8s %-6s %-6s %s\n", "USER", "PID", "MEM%", "COMMAND"} NR>1 {printf "    %-8s %-6s %-6s %s\n", $1, $2, $4, substr($0, index($0,$11))}' | cut -c1-100
     hr
+}
+
+
+# 端口占用查看
+sys_info_ports() {
+    while :; do
+        clear; show_banner
+        sec "端口占用查看"
+        echo "  1) 查看所有监听端口"
+        echo "  2) 查询指定端口"
+        echo "  0) 返回上一页"
+        echo
+        hr
+        local c
+        read -rp "$(echo -e "${CYAN}请选择 [0-2]: ${NC}")" c
+        case "$c" in
+            1)
+                clear; show_banner
+                sec "所有监听端口"
+                if ! command -v ss >/dev/null 2>&1; then
+                    err "未找到 ss 命令，请先安装 iproute2"
+                    pause
+                    continue
+                fi
+                local out
+                out=$(ss -H -tulnp 2>/dev/null)
+                if [[ -z "$out" ]]; then
+                    warn "未发现监听端口"
+                else
+                    printf "  %-6s %-34s %s\n" "协议" "监听地址:端口" "进程"
+                    echo "$out" | awk '
+                        {
+                            proto=$1;
+                            local_addr=$5;
+                            proc="";
+                            for (i=7; i<=NF; i++) proc=proc $i " ";
+                            gsub(/^users:\(\(\"/, "", proc);
+                            gsub(/\".*$/, "", proc);
+                            if (proc == "") proc="-";
+                            printf "  %-6s %-34s %s\n", proto, local_addr, proc;
+                        }
+                    '
+                fi
+                pause
+                ;;
+            2)
+                clear; show_banner
+                sec "查询指定端口"
+                local port line
+                read -rp "$(echo -e "${CYAN}请输入端口: ${NC}")" port
+                if ! [[ "$port" =~ ^[0-9]+$ ]] || (( port < 1 || port > 65535 )); then
+                    err "端口无效"
+                    pause
+                    continue
+                fi
+                if ! command -v ss >/dev/null 2>&1; then
+                    err "未找到 ss 命令，请先安装 iproute2"
+                    pause
+                    continue
+                fi
+                line=$(ss -H -tulnp 2>/dev/null | awk -v p=":$port" '$5 ~ p"$" || $5 ~ p"%" {print}')
+                if [[ -z "$line" ]]; then
+                    warn "端口 $port 当前未被监听"
+                else
+                    printf "  %-6s %-34s %s\n" "协议" "监听地址:端口" "进程"
+                    echo "$line" | awk '
+                        {
+                            proto=$1;
+                            local_addr=$5;
+                            proc="";
+                            for (i=7; i<=NF; i++) proc=proc $i " ";
+                            gsub(/^users:\(\(\"/, "", proc);
+                            gsub(/\".*$/, "", proc);
+                            if (proc == "") proc="-";
+                            printf "  %-6s %-34s %s\n", proto, local_addr, proc;
+                        }
+                    '
+                fi
+                pause
+                ;;
+            0|"") return ;;
+            *) err "无效"; sleep 1 ;;
+        esac
+    done
+}
+
+# 判断 PID 是否属于当前脚本/终端会话的父进程链
+is_current_session_pid() {
+    local target="$1"
+    local p="$$"
+    while [[ -n "$p" && "$p" != "0" ]]; do
+        [[ "$target" == "$p" ]] && return 0
+        p=$(ps -o ppid= -p "$p" 2>/dev/null | awk '{print $1}')
+    done
+    return 1
+}
+
+# 结束指定进程
+sys_kill_process() {
+    clear; show_banner
+    sec "结束指定进程"
+    local pid comm user exe confirm
+    read -rp "$(echo -e "${CYAN}请输入要结束的 PID: ${NC}")" pid
+
+    if ! [[ "$pid" =~ ^[0-9]+$ ]]; then
+        err "PID 无效"
+        pause
+        return
+    fi
+
+    if ! kill -0 "$pid" 2>/dev/null; then
+        err "PID $pid 不存在或无权限访问"
+        pause
+        return
+    fi
+
+    comm=$(ps -p "$pid" -o comm= 2>/dev/null | awk '{print $1}')
+    user=$(ps -p "$pid" -o user= 2>/dev/null | awk '{print $1}')
+    exe=$(readlink -f "/proc/$pid/exe" 2>/dev/null || true)
+    [[ -z "$comm" ]] && comm="未知"
+    [[ -z "$user" ]] && user="未知"
+    [[ -z "$exe" ]] && exe="无法读取"
+
+    # 硬保护：关键进程坚决不允许结束
+    local protected_re='^(sshd|ssh|systemd|init|bash|sh|dash|zsh|sudo|su|login|getty|agetty|dbus-daemon|systemd-networkd|systemd-resolved|NetworkManager|cron|crond|dockerd|containerd)$'
+    if [[ "$pid" == "1" ]] || [[ "$comm" =~ $protected_re ]] || is_current_session_pid "$pid"; then
+        err "该进程属于系统/SSH/当前会话关键进程，禁止结束"
+        echo
+        echo "  PID：$pid"
+        echo "  进程：$comm"
+        echo "  路径：$exe"
+        echo "  用户：$user"
+        pause
+        return
+    fi
+
+    echo "即将结束进程："
+    echo
+    echo "PID：$pid"
+    echo "进程：$comm"
+    echo "路径：$exe"
+    echo "用户：$user"
+    echo
+    read -rp "确认结束？[y/N]: " confirm
+    [[ "$confirm" != "y" && "$confirm" != "Y" ]] && { warn "已取消"; pause; return; }
+
+    if kill "$pid" 2>/dev/null; then
+        sleep 1
+        if kill -0 "$pid" 2>/dev/null; then
+            warn "普通结束失败，进程仍在运行"
+            read -rp "是否强制结束 kill -9？[y/N]: " confirm
+            if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
+                if kill -9 "$pid" 2>/dev/null; then
+                    sleep 1
+                    if kill -0 "$pid" 2>/dev/null; then
+                        err "强制结束失败，进程仍在运行"
+                    else
+                        ok "进程已强制结束"
+                    fi
+                else
+                    err "强制结束失败，可能权限不足"
+                fi
+            else
+                warn "已取消强制结束"
+            fi
+        else
+            ok "进程已结束"
+        fi
+    else
+        err "结束失败，可能权限不足"
+    fi
+    pause
 }
 
 # 可疑进程检测
@@ -2208,7 +2384,7 @@ dns_restore_config() {
 dns_test_resolve() {
     clear; show_banner
     sec "测试 DNS 解析"
-    local domain cur_v4 cur_v6 result_v4 result_v6 ip
+    local domain cur_v4 cur_v6 result_v4 result_v6
     read -rp "请输入测试域名 [google.com]: " domain
     domain="${domain:-google.com}"
 
@@ -2220,25 +2396,12 @@ dns_test_resolve() {
     echo
 
     if [[ -n "$cur_v4" ]]; then
-        result_v4=""
-
-        # 优先使用系统解析结果，避免 dig/正则差异造成误判
-        while read -r ip _; do
-            if is_ipv4_addr "$ip"; then
-                [[ " $result_v4 " == *" $ip "* ]] || result_v4="$result_v4 $ip"
-            fi
-        done < <(getent ahostsv4 "$domain" 2>/dev/null || true)
-
-        # getent 没结果时，再用 dig A 兜底
-        if [[ -z "$(echo "$result_v4" | xargs echo)" ]] && command -v dig >/dev/null 2>&1; then
-            while read -r ip; do
-                if is_ipv4_addr "$ip"; then
-                    [[ " $result_v4 " == *" $ip "* ]] || result_v4="$result_v4 $ip"
-                fi
-            done < <(dig +short A "$domain" 2>/dev/null || true)
+        if command -v dig >/dev/null 2>&1; then
+            result_v4=$(dig +short A "$domain" 2>/dev/null | awk '/^([0-9]{1,3}\.){3}[0-9]{1,3}$/ {print}' | head -n 3 | xargs echo)
+        else
+            result_v4=$(getent ahostsv4 "$domain" 2>/dev/null | awk '{print $1}' | awk '!seen[$0]++' | head -n 3 | xargs echo)
         fi
 
-        result_v4=$(echo "$result_v4" | xargs echo | awk '{print $1, $2, $3}' | xargs echo)
         if [[ -n "$result_v4" ]]; then
             ok "IPv4 解析：成功"
             echo -e "  结果: $result_v4"
@@ -2252,25 +2415,12 @@ dns_test_resolve() {
     echo
 
     if [[ -n "$cur_v6" ]]; then
-        result_v6=""
-
-        # 优先使用系统解析结果
-        while read -r ip _; do
-            if is_ipv6_addr "$ip"; then
-                [[ " $result_v6 " == *" $ip "* ]] || result_v6="$result_v6 $ip"
-            fi
-        done < <(getent ahostsv6 "$domain" 2>/dev/null || true)
-
-        # getent 没结果时，再用 dig AAAA 兜底
-        if [[ -z "$(echo "$result_v6" | xargs echo)" ]] && command -v dig >/dev/null 2>&1; then
-            while read -r ip; do
-                if is_ipv6_addr "$ip"; then
-                    [[ " $result_v6 " == *" $ip "* ]] || result_v6="$result_v6 $ip"
-                fi
-            done < <(dig +short AAAA "$domain" 2>/dev/null || true)
+        if command -v dig >/dev/null 2>&1; then
+            result_v6=$(dig +short AAAA "$domain" 2>/dev/null | awk '/:/ {print}' | head -n 3 | xargs echo)
+        else
+            result_v6=$(getent ahostsv6 "$domain" 2>/dev/null | awk '{print $1}' | awk '/:/ && !seen[$0]++' | head -n 3 | xargs echo)
         fi
 
-        result_v6=$(echo "$result_v6" | xargs echo | awk '{print $1, $2, $3}' | xargs echo)
         if [[ -n "$result_v6" ]]; then
             ok "IPv6 解析：成功"
             echo -e "  结果: $result_v6"

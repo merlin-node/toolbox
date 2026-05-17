@@ -1205,7 +1205,7 @@ menu_ssh() {
         echo "  2) 修改 SSH 端口"
         echo "  3) 上传公钥 / 启用密钥登录"
         echo "  4) 禁 root 密码登录"
-        echo "  5) fail2ban 安装配置"
+        echo "  5) fail2ban 管理"
         echo "  0) 返回上一页"
         hr
         local c
@@ -1215,7 +1215,7 @@ menu_ssh() {
             2) ssh_change_port; pause ;;
             3) ssh_setup_key; pause ;;
             4) ssh_disable_root_password; pause ;;
-            5) ssh_setup_fail2ban; pause ;;
+            5) menu_fail2ban ;;
             0|"") return ;;
             *) err "无效"; sleep 1 ;;
         esac
@@ -1316,12 +1316,70 @@ EOF
     fi
 }
 
-ssh_setup_fail2ban() {
-    clear; show_banner
-    sec "fail2ban 安装配置"
+menu_fail2ban() {
+    while :; do
+        clear; show_banner
+        sec "fail2ban 管理"
+        if ! command -v fail2ban-client >/dev/null 2>&1; then
+            echo -e "  状态: ${RED}未安装${NC}"
+            hr
+            echo "  1) 安装 fail2ban (默认保护 SSH)"
+            echo "  0) 返回上一页"
+            hr
+            local c
+            read -rp "$(echo -e "${CYAN}请选择 [0-1]: ${NC}")" c
+            case "$c" in
+                1) f2b_install; pause ;;
+                0|"") return ;;
+                *) err "无效"; sleep 1 ;;
+            esac
+        else
+            local active
+            if systemctl is-active --quiet fail2ban; then
+                active="${GREEN}运行中${NC}"
+            else
+                active="${RED}已停止${NC}"
+            fi
+            local ver
+            ver=$(fail2ban-client --version 2>/dev/null | head -1)
+            echo -e "  状态: ${active}    版本: ${ver:-未知}"
+            # 当前 sshd jail 概况
+            local jail_info
+            jail_info=$(fail2ban-client status sshd 2>/dev/null)
+            if [[ -n "$jail_info" ]]; then
+                local cur_banned cur_failed
+                cur_banned=$(echo "$jail_info" | awk -F: '/Currently banned/{gsub(/^ +/,"",$2); print $2}')
+                cur_failed=$(echo "$jail_info" | awk -F: '/Currently failed/{gsub(/^ +/,"",$2); print $2}')
+                echo -e "  SSH jail: 当前封禁 ${YELLOW}${cur_banned:-0}${NC}    当前失败 ${YELLOW}${cur_failed:-0}${NC}"
+            fi
+            hr
+            echo "  1) 查看 SSH jail 状态详情"
+            echo "  2) 查看被封禁的 IP 列表"
+            echo "  3) 解封指定 IP"
+            echo "  4) 重启 fail2ban"
+            echo "  5) 编辑配置 (jail.local)"
+            echo "  6) 卸载 fail2ban"
+            echo "  0) 返回上一页"
+            hr
+            local c
+            read -rp "$(echo -e "${CYAN}请选择 [0-6]: ${NC}")" c
+            case "$c" in
+                1) clear; fail2ban-client status sshd | sed 's/^/  /'; pause ;;
+                2) f2b_list_banned; pause ;;
+                3) f2b_unban; pause ;;
+                4) systemctl restart fail2ban && ok "已重启"; sleep 1 ;;
+                5) f2b_edit; pause ;;
+                6) f2b_uninstall; pause ;;
+                0|"") return ;;
+                *) err "无效"; sleep 1 ;;
+            esac
+        fi
+    done
+}
+
+f2b_install() {
     msg "安装 fail2ban..."
     apt-get install -y fail2ban
-    # 默认配置：保护 sshd，10 分钟内 5 次失败封 1 小时
     cat > /etc/fail2ban/jail.local << EOF
 [DEFAULT]
 bantime = 1h
@@ -1336,7 +1394,7 @@ EOF
     systemctl restart fail2ban
     sleep 1
     if systemctl is-active --quiet fail2ban; then
-        ok "fail2ban 已启用"
+        ok "fail2ban 已启用 (5 次失败封 1 小时)"
         fail2ban-client status sshd 2>/dev/null | sed 's/^/  /'
     else
         err "启动失败"
@@ -1344,24 +1402,153 @@ EOF
     fi
 }
 
+f2b_list_banned() {
+    clear; show_banner
+    sec "被封禁的 IP"
+    local banned
+    banned=$(fail2ban-client status sshd 2>/dev/null | awk -F: '/Banned IP list/{gsub(/^ +/,"",$2); print $2}')
+    if [[ -z "$banned" ]]; then
+        echo "  （无）"
+    else
+        echo "$banned" | tr ' ' '\n' | sed 's/^/  /'
+    fi
+}
+
+f2b_unban() {
+    clear; show_banner
+    sec "解封 IP"
+    read -rp "$(echo -e "${CYAN}输入要解封的 IP (回车取消): ${NC}")" ip
+    [[ -z "$ip" ]] && return
+    if fail2ban-client set sshd unbanip "$ip" 2>&1 | grep -q '^1$\|unbanned'; then
+        ok "$ip 已解封"
+    else
+        err "解封失败（可能本来就没被封）"
+    fi
+}
+
+f2b_edit() {
+    [[ -f /etc/fail2ban/jail.local ]] || {
+        err "jail.local 不存在"; return
+    }
+    cp /etc/fail2ban/jail.local "/etc/fail2ban/jail.local.bak.$(date +%Y%m%d-%H%M%S)"
+    command -v nano >/dev/null 2>&1 || apt-get install -y nano >/dev/null 2>&1
+    nano /etc/fail2ban/jail.local
+    if confirm "重启 fail2ban 使配置生效？" Y; then
+        systemctl restart fail2ban && ok "已重启"
+    fi
+}
+
+f2b_uninstall() {
+    clear; show_banner
+    sec "卸载 fail2ban"
+    confirm "确认卸载 fail2ban？" N || return
+    systemctl stop fail2ban 2>/dev/null
+    systemctl disable fail2ban 2>/dev/null
+    apt-get purge -y fail2ban
+    rm -rf /etc/fail2ban
+    ok "fail2ban 已卸载"
+}
+
 menu_dd() {
     clear; show_banner
     sec "${RED}DD 重装系统${NC}"
-    warn "DD 重装会清空所有数据，无法恢复！"
-    warn "请确保你已经备份了所有重要数据。"
+    warn "DD 重装会清空整台 VPS 的所有数据，无法恢复！"
+    warn "重装过程中会断开 SSH，结束后用新密码 + 新端口重连"
     echo
-    echo "  推荐使用 bin456789/reinstall 脚本（社区维护，支持系统多）"
+    echo "  使用 ${BOLD}bin456789/reinstall${NC} 脚本（社区维护，支持系统全）"
     echo "  https://github.com/bin456789/reinstall"
+    hr
+    echo "  常见系统："
+    echo "   1) Debian 13"
+    echo "   2) Debian 12"
+    echo "   3) Ubuntu 24.04"
+    echo "   4) Ubuntu 22.04"
+    echo "   5) AlmaLinux 9"
+    echo "   6) Rocky Linux 9"
+    echo "   7) CentOS 9 Stream"
+    echo "   8) Fedora 41"
+    echo "   9) Alpine 3.20"
+    echo "  10) 其它 (手动输入: 系统名 + 版本)"
+    echo "   0) 返回"
+    hr
+    local c sys
+    read -rp "$(echo -e "${CYAN}请选择 [0-10]: ${NC}")" c
+    case "$c" in
+        1)  sys="debian 13" ;;
+        2)  sys="debian 12" ;;
+        3)  sys="ubuntu 24.04" ;;
+        4)  sys="ubuntu 22.04" ;;
+        5)  sys="alma 9" ;;
+        6)  sys="rocky 9" ;;
+        7)  sys="centos 9" ;;
+        8)  sys="fedora 41" ;;
+        9)  sys="alpine 3.20" ;;
+        10)
+            read -rp "  系统名 (如 debian / ubuntu / arch / windows): " os
+            read -rp "  版本   (如 13 / 24.04，留空表示无版本): " ver
+            [[ -z "$os" ]] && return
+            sys="$os $ver"
+            ;;
+        0|"") return ;;
+        *) err "无效"; sleep 1; return ;;
+    esac
+
+    # 询问密码（必填，两次核对）
     echo
-    confirm "下载并运行 reinstall 脚本？" N || return
-    curl -O https://raw.githubusercontent.com/bin456789/reinstall/main/reinstall.sh \
+    echo -e "  ${CYAN}新 root 密码${NC}（必填）"
+    local newpw pw2
+    while :; do
+        read -rp "  密码: " newpw
+        if [[ -z "$newpw" ]]; then
+            err "密码不能为空"
+            continue
+        fi
+        read -rp "  再输一次: " pw2
+        if [[ "$newpw" == "$pw2" ]]; then
+            break
+        fi
+        err "两次输入不一致，请重新输入"
+    done
+
+    # 询问 SSH 端口（必填）
+    echo
+    echo -e "  ${CYAN}新系统的 SSH 端口${NC}（必填，1-65535）"
+    local newport
+    while :; do
+        read -rp "  端口: " newport
+        if [[ -z "$newport" ]]; then
+            err "端口不能为空"
+            continue
+        fi
+        if ! [[ "$newport" =~ ^[0-9]+$ ]] || (( newport < 1 || newport > 65535 )); then
+            err "端口无效（必须是 1-65535 的数字）"
+            continue
+        fi
+        break
+    done
+
+    # 最终确认
+    echo
+    hr
+    echo -e "  即将重装为: ${BOLD}${sys}${NC}"
+    echo -e "  新 root 密码: ${BOLD}${newpw}${NC}"
+    echo -e "  新 SSH 端口:  ${BOLD}${newport}${NC}"
+    hr
+    confirm "确认开始 DD 重装？" N || { warn "已取消"; return; }
+
+    msg "下载 reinstall 脚本..."
+    cd /root 2>/dev/null || cd /tmp
+    curl -fsSL -O https://raw.githubusercontent.com/bin456789/reinstall/main/reinstall.sh \
         || wget -O reinstall.sh https://raw.githubusercontent.com/bin456789/reinstall/main/reinstall.sh
     chmod +x reinstall.sh
+
+    msg "执行 DD 重装..."
+    warn "完成后 VPS 会自动重启，重启时 SSH 会断开"
+    warn "请等待 5-15 分钟，然后用新密码 + 端口 ${newport} 尝试重连"
+    sleep 3
+    bash reinstall.sh $sys --password "$newpw" --ssh-port "$newport"
     echo
-    msg "脚本已下载到当前目录。按 reinstall 的提示选择系统并执行："
-    echo "    bash reinstall.sh debian 13     # 重装 Debian 13"
-    echo "    bash reinstall.sh ubuntu 24.04  # 重装 Ubuntu 24.04"
-    echo
+    msg "reinstall 已配置完成，请按提示重启系统开始重装"
     pause
 }
 
@@ -1414,8 +1601,9 @@ update_script() {
 
 do_uninstall() {
     clear; show_banner
-    sec "${RED}卸载脚本${NC}"
-    echo "  仅卸载 tb 命令本身，不会卸载它装过的任何软件"
+    sec "${RED}卸载 toolbox${NC}"
+    echo "  仅删除 /usr/local/bin/tb，不动其他任何东西"
+    echo "  各软件的卸载请去对应菜单（fail2ban / Docker / BBR 等）"
     echo
     if confirm "确认卸载？" N; then
         rm -f "$TB_SCRIPT_PATH"

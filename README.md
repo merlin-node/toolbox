@@ -10,10 +10,11 @@ curl -fsSL -o tb https://raw.githubusercontent.com/merlin-node/toolbox/main/tb.s
 
 之后输入 `tb` 即可。
 
-> 没有 curl 的精简镜像可用 wget：
+> **DD 后的裸系统没有 curl 也没有 wget？** 先装一下：
 > ```bash
-> wget -O tb https://raw.githubusercontent.com/merlin-node/toolbox/main/tb.sh && chmod +x tb && sudo mv tb /usr/local/bin/tb
+> apt update && apt install -y curl
 > ```
+> 然后跑上面的安装命令。
 
 ## 功能
 

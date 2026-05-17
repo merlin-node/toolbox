@@ -2083,18 +2083,7 @@ dns_show_config() {
     echo -e "  搜索域: ${search_domain:-无}"
     echo -e "  管理方式: $mgr"
 
-    if [[ -e /etc/resolv.conf ]]; then
-        echo
-        echo -e "${CYAN}/etc/resolv.conf:${NC} $(readlink -f /etc/resolv.conf 2>/dev/null || echo /etc/resolv.conf)"
-        grep -E '^[[:space:]]*(nameserver|search|domain)[[:space:]]+' /etc/resolv.conf 2>/dev/null | sed 's/^/  /' || true
-    fi
-
-    if command -v resolvectl >/dev/null 2>&1; then
-        echo
-        echo -e "${CYAN}resolvectl 摘要:${NC}"
-        resolvectl dns 2>/dev/null | sed 's/^/  /' || true
-        resolvectl domain 2>/dev/null | sed 's/^/  /' || true
-    fi
+    echo
     pause
 }
 
@@ -2219,24 +2208,54 @@ dns_restore_config() {
 dns_test_resolve() {
     clear; show_banner
     sec "测试 DNS 解析"
-    local domain
+    local domain cur_v4 cur_v6 result_v4 result_v6
     read -rp "请输入测试域名 [google.com]: " domain
     domain="${domain:-google.com}"
+
+    cur_v4=$(dns_current_v4)
+    cur_v6=$(dns_current_v6)
+
     echo
-    msg "测试 getent: $domain"
-    getent ahosts "$domain" | head -n 10 || warn "getent 测试失败"
-    if command -v dig >/dev/null 2>&1; then
-        echo
-        msg "测试 dig: $domain"
-        dig +short "$domain" | head -n 10 || warn "dig 测试失败"
-    elif command -v nslookup >/dev/null 2>&1; then
-        echo
-        msg "测试 nslookup: $domain"
-        nslookup "$domain" || warn "nslookup 测试失败"
+    echo -e "${CYAN}测试域名:${NC} $domain"
+    echo
+
+    if [[ -n "$cur_v4" ]]; then
+        if command -v dig >/dev/null 2>&1; then
+            result_v4=$(dig +short A "$domain" 2>/dev/null | awk '/^([0-9]{1,3}\.){3}[0-9]{1,3}$/ {print}' | head -n 3 | xargs echo)
+        else
+            result_v4=$(getent ahostsv4 "$domain" 2>/dev/null | awk '{print $1}' | awk '!seen[$0]++' | head -n 3 | xargs echo)
+        fi
+
+        if [[ -n "$result_v4" ]]; then
+            ok "IPv4 解析：成功"
+            echo -e "  结果: $result_v4"
+        else
+            err "IPv4 解析：失败"
+        fi
     else
-        echo
-        warn "未安装 dig/nslookup，可在基础工具里安装 dnsutils"
+        warn "IPv4 DNS 未配置，跳过 IPv4 测试"
     fi
+
+    echo
+
+    if [[ -n "$cur_v6" ]]; then
+        if command -v dig >/dev/null 2>&1; then
+            result_v6=$(dig +short AAAA "$domain" 2>/dev/null | awk '/:/ {print}' | head -n 3 | xargs echo)
+        else
+            result_v6=$(getent ahostsv6 "$domain" 2>/dev/null | awk '{print $1}' | awk '/:/ && !seen[$0]++' | head -n 3 | xargs echo)
+        fi
+
+        if [[ -n "$result_v6" ]]; then
+            ok "IPv6 解析：成功"
+            echo -e "  结果: $result_v6"
+        else
+            err "IPv6 解析：失败"
+        fi
+    else
+        warn "IPv6 DNS 未配置，跳过 IPv6 测试"
+    fi
+
+    echo
     pause
 }
 

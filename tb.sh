@@ -143,23 +143,32 @@ sys_update_clean() {
     pause
 }
 
-sys_info() {
+menu_system() {
     while :; do
         clear; show_banner
-        sec "系统信息查询"
-        echo "  1) 系统概览（详细）"
-        echo "  2) 实时进程监控（Top 10）"
-        echo "  3) 可疑进程检测（防挖矿）"
-        echo "  4) htop 交互式监控"
+        sec "系统"
+        echo -e "  ${BOLD}── 系统信息查询 ──${NC}"
+        echo "  1) 系统更新清理"
+        echo "  2) 系统概览"
+        echo "  3) 实时进程监控 (Top 10)"
+        echo "  4) 可疑进程检测 (防挖矿)"
+        echo "  5) htop 交互监控"
+        echo
+        echo -e "  ${BOLD}── 基础配置 ──${NC}"
+        echo "  6) 时区设置          当前: $(timedatectl 2>/dev/null | awk '/Time zone/{print $3}')"
+        echo "  7) hostname 修改     当前: $(hostname)"
+        echo "  8) 添加 sudo 用户"
+        echo
         echo "  0) 返回上一页"
         hr
         local c
-        read -rp "$(echo -e "${CYAN}请选择 [0-4]: ${NC}")" c
+        read -rp "$(echo -e "${CYAN}请选择 [0-8]: ${NC}")" c
         case "$c" in
-            1) sys_info_overview; pause ;;
-            2) sys_info_top; pause ;;
-            3) sys_info_suspicious ;;
-            4)
+            1) sys_update_clean ;;
+            2) sys_info_overview; pause ;;
+            3) sys_info_top; pause ;;
+            4) sys_info_suspicious ;;
+            5)
                 if command -v htop >/dev/null 2>&1; then
                     htop
                 else
@@ -167,6 +176,9 @@ sys_info() {
                     sleep 2
                 fi
                 ;;
+            6) cfg_timezone; pause ;;
+            7) cfg_hostname; pause ;;
+            8) cfg_adduser; pause ;;
             0|"") return ;;
             *) err "无效"; sleep 1 ;;
         esac
@@ -427,30 +439,8 @@ menu_basic_tools() {
 }
 
 # =============================================================================
-# 3. 基础配置
+# 3. 基础配置（拆出来的：时区/hostname/sudo用户进 menu_system，swap 独立）
 # =============================================================================
-menu_basic_config() {
-    while :; do
-        clear; show_banner
-        sec "基础配置"
-        echo "  1) 时区设置          当前: $(timedatectl 2>/dev/null | awk '/Time zone/{print $3}')"
-        echo "  2) swap 管理         当前: $(free -h | awk '/Swap:/ {print $2}')"
-        echo "  3) hostname 修改     当前: $(hostname)"
-        echo "  4) 添加 sudo 用户"
-        echo "  0) 返回上一页"
-        hr
-        local c
-        read -rp "$(echo -e "${CYAN}请选择 [0-4]: ${NC}")" c
-        case "$c" in
-            1) cfg_timezone; pause ;;
-            2) cfg_swap ;;
-            3) cfg_hostname; pause ;;
-            4) cfg_adduser; pause ;;
-            0|"") return ;;
-            *) err "无效"; sleep 1 ;;
-        esac
-    done
-}
 
 cfg_timezone() {
     clear; show_banner
@@ -676,7 +666,380 @@ disable_bbr() {
 }
 
 # =============================================================================
-# 5. Docker 管理
+# 5. Caddy 反代（从 ca 脚本整合）
+# =============================================================================
+CADDYFILE="/etc/caddy/Caddyfile"
+CADDY_META_DIR="/etc/caddy/.meta"
+CADDY_META_FILE="${CADDY_META_DIR}/current"
+CADDY_LOG_DIR="/var/log/caddy"
+
+caddy_installed() { command -v caddy >/dev/null 2>&1; }
+
+caddy_version_str() {
+    caddy version 2>/dev/null | awk '{print $1}' | head -1
+}
+
+caddy_install() {
+    if caddy_installed; then
+        return 0
+    fi
+    msg "安装依赖..."
+    apt-get update -y >/dev/null 2>&1
+    apt-get install -y debian-keyring debian-archive-keyring apt-transport-https curl >/dev/null 2>&1
+
+    msg "添加 Caddy 官方源..."
+    curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
+        | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg 2>/dev/null
+    curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' \
+        > /etc/apt/sources.list.d/caddy-stable.list 2>/dev/null
+
+    msg "安装 Caddy..."
+    apt-get update -y >/dev/null 2>&1
+    apt-get install -y caddy
+    mkdir -p "$CADDY_LOG_DIR" "$CADDY_META_DIR"
+    ok "Caddy 安装完成"
+}
+
+caddy_uninstall() {
+    clear; show_banner
+    sec "${RED}卸载 Caddy${NC}"
+    echo "  将删除: Caddy 程序、配置 /etc/caddy、日志 /var/log/caddy"
+    echo
+    confirm "确认卸载？" N || return
+    systemctl stop caddy 2>/dev/null
+    systemctl disable caddy 2>/dev/null
+    apt-get purge -y caddy >/dev/null 2>&1
+    rm -rf /etc/caddy "$CADDY_LOG_DIR" /var/lib/caddy
+    rm -f /etc/apt/sources.list.d/caddy-stable.list
+    ok "Caddy 已卸载"
+}
+
+caddy_check_port() {
+    local ip="$1" port="$2"
+    case "$ip" in
+        127.0.0.1|localhost|::1) ;;
+        *) return 0 ;;
+    esac
+    local listener
+    listener=$(ss -tlnp 2>/dev/null | awk -v p=":$port" '$4 ~ p"$" {print; exit}')
+    if [[ -z "$listener" ]]; then
+        warn "本机端口 ${port} 当前无服务监听"
+        echo -e "  ${YELLOW}Caddy 反代过去会返回错误，请先启动后端服务${NC}"
+        echo
+        read -rp "$(echo -e "${CYAN}仍要继续? [y/N]: ${NC}")" go
+        [[ "$go" =~ ^[Yy]$ ]] || return 1
+    else
+        local proc
+        proc=$(echo "$listener" | grep -oP '"\K[^"]+' | head -1)
+        echo -e "  ${GREEN}[√]${NC} 后端服务已监听：${proc:-unknown} on :${port}"
+    fi
+    return 0
+}
+
+caddy_write_apply() {
+    local svc="$1" domain="$2" ip="$3" port="$4" timeout="$5"
+    mkdir -p "$(dirname "$CADDYFILE")" "$CADDY_META_DIR" "$CADDY_LOG_DIR"
+    cat > "$CADDYFILE" << EOF
+# 由 tb 工具生成，元数据存于 ${CADDY_META_FILE}
+${domain} {
+    log {
+        output file ${CADDY_LOG_DIR}/${svc}.log {
+            roll_size 10mb
+            roll_keep 5
+        }
+    }
+
+    reverse_proxy ${ip}:${port} {
+        transport http {
+            read_timeout ${timeout}s
+            write_timeout ${timeout}s
+        }
+
+        header_up Host {upstream_hostport}
+        header_up X-Real-IP {remote_host}
+        header_up X-Forwarded-For {remote_host}
+        header_up X-Forwarded-Proto {scheme}
+    }
+}
+EOF
+    cat > "$CADDY_META_FILE" << EOF
+CADDY_SVC=${svc}
+CADDY_DOMAIN=${domain}
+CADDY_BACKEND_IP=${ip}
+CADDY_BACKEND_PORT=${port}
+CADDY_TIMEOUT=${timeout}
+EOF
+    echo
+    msg "校验配置..."
+    if ! caddy validate --config "$CADDYFILE" --adapter caddyfile >/dev/null 2>&1; then
+        err "配置校验失败"
+        caddy validate --config "$CADDYFILE" --adapter caddyfile 2>&1 | sed 's/^/  /'
+        return 1
+    fi
+    ok "校验通过"
+    msg "应用配置..."
+    systemctl enable caddy >/dev/null 2>&1 || true
+    if systemctl is-active --quiet caddy; then
+        systemctl reload caddy
+        ok "Caddy 已重载"
+    else
+        systemctl start caddy
+        ok "Caddy 已启动"
+    fi
+}
+
+caddy_load_meta() {
+    [[ -f "$CADDY_META_FILE" ]] || return 1
+    # shellcheck disable=SC1090
+    source "$CADDY_META_FILE"
+    # 兼容旧字段名（早期版本写的 SVC_NAME / DOMAIN 等没前缀的）
+    [[ -z "${CADDY_SVC:-}"          && -n "${SVC_NAME:-}"     ]] && CADDY_SVC="$SVC_NAME"
+    [[ -z "${CADDY_DOMAIN:-}"       && -n "${DOMAIN:-}"       ]] && CADDY_DOMAIN="$DOMAIN"
+    [[ -z "${CADDY_BACKEND_IP:-}"   && -n "${BACKEND_IP:-}"   ]] && CADDY_BACKEND_IP="$BACKEND_IP"
+    [[ -z "${CADDY_BACKEND_PORT:-}" && -n "${BACKEND_PORT:-}" ]] && CADDY_BACKEND_PORT="$BACKEND_PORT"
+    [[ -z "${CADDY_TIMEOUT:-}"      && -n "${TIMEOUT:-}"      ]] && CADDY_TIMEOUT="$TIMEOUT"
+    return 0
+}
+
+caddy_menu_add() {
+    clear; show_banner
+    sec "生成 Caddyfile"
+    if [[ -f "$CADDYFILE" ]] && caddy_load_meta; then
+        echo -e "  ${YELLOW}已存在配置${NC}"
+        echo
+        echo "  服务:     ${CADDY_SVC}"
+        echo "  域名:     ${CADDY_DOMAIN}"
+        echo "  后端:     ${CADDY_BACKEND_IP}:${CADDY_BACKEND_PORT}"
+        echo
+        echo -e "  ${YELLOW}继续将覆盖现有配置${NC}"
+        hr
+        read -rp "$(echo -e "${CYAN}是否继续? [y/N]: ${NC}")" go
+        [[ "$go" =~ ^[Yy]$ ]] || return
+        echo
+    fi
+    local svc domain ip port timeout
+    read -rp "$(echo -e "${CYAN}服务名称（用于日志文件名，例如 myapp）: ${NC}")" svc
+    [[ -z "$svc" ]] && { err "服务名称不能为空"; pause; return; }
+    read -rp "$(echo -e "${CYAN}域名（例如 api.example.com）: ${NC}")" domain
+    [[ -z "$domain" ]] && { err "域名不能为空"; pause; return; }
+    read -rp "$(echo -e "${CYAN}后端 IP [${NC}127.0.0.1${CYAN}]: ${NC}")" ip
+    ip="${ip:-127.0.0.1}"
+    read -rp "$(echo -e "${CYAN}后端端口: ${NC}")" port
+    [[ -z "$port" ]] && { err "端口不能为空"; pause; return; }
+    echo
+    if ! caddy_check_port "$ip" "$port"; then
+        pause; return
+    fi
+    echo
+    read -rp "$(echo -e "${CYAN}超时(秒) [${NC}300${CYAN}]: ${NC}")" timeout
+    timeout="${timeout:-300}"
+    if caddy_write_apply "$svc" "$domain" "$ip" "$port" "$timeout"; then
+        echo
+        hr
+        echo -e "  ${GREEN}[√]${NC} 部署完成"
+        echo
+        echo "  域名:     https://${domain}"
+        echo "  后端:     ${ip}:${port}"
+        echo "  超时:     ${timeout}s"
+        echo "  日志:     ${CADDY_LOG_DIR}/${svc}.log"
+        hr
+    fi
+    pause
+}
+
+caddy_menu_view() {
+    clear; show_banner
+    sec "查看配置"
+    if ! caddy_load_meta; then
+        warn "尚未生成配置"
+        echo -e "  ${YELLOW}请先用「生成 Caddyfile」创建${NC}"
+        pause; return
+    fi
+    echo "  服务名称: ${CADDY_SVC}"
+    echo "  域名:     ${CADDY_DOMAIN}"
+    echo "  后端 IP:  ${CADDY_BACKEND_IP}"
+    echo "  后端端口: ${CADDY_BACKEND_PORT}"
+    echo "  超时:     ${CADDY_TIMEOUT}s"
+    echo "  日志:     ${CADDY_LOG_DIR}/${CADDY_SVC}.log"
+    echo
+    if systemctl is-active --quiet caddy; then
+        echo -e "  状态:     ${GREEN}running${NC}"
+    else
+        echo -e "  状态:     ${RED}stopped${NC}"
+    fi
+    pause
+}
+
+caddy_menu_edit() {
+    while :; do
+        clear; show_banner
+        sec "更改配置"
+        if ! caddy_load_meta; then
+            warn "尚未生成配置"
+            pause; return
+        fi
+        echo "  1) 服务名称   ${CADDY_SVC}"
+        echo "  2) 域名       ${CADDY_DOMAIN}"
+        echo "  3) 后端 IP    ${CADDY_BACKEND_IP}"
+        echo "  4) 后端端口   ${CADDY_BACKEND_PORT}"
+        echo "  5) 超时       ${CADDY_TIMEOUT}s"
+        echo "  0) 返回上一页"
+        hr
+        local c new
+        read -rp "$(echo -e "${CYAN}选择要修改的项 [0-5]: ${NC}")" c
+        case "$c" in
+            0|"") return ;;
+            1) read -rp "$(echo -e "${CYAN}服务名称 [${NC}${CADDY_SVC}${CYAN}]: ${NC}")" new
+               CADDY_SVC="${new:-$CADDY_SVC}" ;;
+            2) read -rp "$(echo -e "${CYAN}域名 [${NC}${CADDY_DOMAIN}${CYAN}]: ${NC}")" new
+               CADDY_DOMAIN="${new:-$CADDY_DOMAIN}" ;;
+            3) read -rp "$(echo -e "${CYAN}后端 IP [${NC}${CADDY_BACKEND_IP}${CYAN}]: ${NC}")" new
+               CADDY_BACKEND_IP="${new:-$CADDY_BACKEND_IP}" ;;
+            4) read -rp "$(echo -e "${CYAN}后端端口 [${NC}${CADDY_BACKEND_PORT}${CYAN}]: ${NC}")" new
+               new="${new:-$CADDY_BACKEND_PORT}"
+               if [[ "$new" != "$CADDY_BACKEND_PORT" ]]; then
+                   echo
+                   if ! caddy_check_port "$CADDY_BACKEND_IP" "$new"; then
+                       pause; continue
+                   fi
+               fi
+               CADDY_BACKEND_PORT="$new" ;;
+            5) read -rp "$(echo -e "${CYAN}超时(秒) [${NC}${CADDY_TIMEOUT}${CYAN}]: ${NC}")" new
+               CADDY_TIMEOUT="${new:-$CADDY_TIMEOUT}" ;;
+            *) err "无效"; sleep 1; continue ;;
+        esac
+        caddy_write_apply "$CADDY_SVC" "$CADDY_DOMAIN" "$CADDY_BACKEND_IP" "$CADDY_BACKEND_PORT" "$CADDY_TIMEOUT"
+        pause
+    done
+}
+
+caddy_view_log() {
+    local n="${1:-50}"
+    if ! caddy_load_meta; then
+        err "尚未生成配置，无日志可看"
+        return
+    fi
+    local f="${CADDY_LOG_DIR}/${CADDY_SVC}.log"
+    if [[ -s "$f" ]]; then
+        echo -e "  ${BLUE}>>> ${BOLD}${f}${NC}  (最近 ${n} 行)"
+        echo
+        tail -n "$n" "$f" | sed 's/^/  /'
+    else
+        warn "Caddy 文件日志为空，改读 systemd 日志"
+        echo
+        journalctl -u caddy -n "$n" --no-pager | sed 's/^/  /'
+    fi
+}
+
+caddy_menu_service() {
+    while :; do
+        clear; show_banner
+        sec "Caddy 服务管理"
+        local active="${RED}stopped${NC}" enabled="${RED}未启用${NC}"
+        local ver
+        systemctl is-active --quiet caddy && active="${GREEN}running${NC}"
+        systemctl is-enabled --quiet caddy 2>/dev/null && enabled="${GREEN}开机自启${NC}"
+        ver=$(caddy_version_str)
+        echo -e "  状态: ${active}    自启: ${enabled}    版本: ${ver:-未知}"
+        hr
+        echo "  1) 启动 Caddy"
+        echo "  2) 停止 Caddy"
+        echo "  3) 重启 Caddy"
+        echo "  4) 查看 systemd 状态"
+        echo "  5) 最近 50 行日志"
+        echo "  6) 实时跟踪日志 (Ctrl+C 退出)"
+        echo "  7) 清空日志文件"
+        echo "  8) 更新 Caddy 到最新版"
+        echo "  9) 卸载 Caddy"
+        echo "  0) 返回上一页"
+        hr
+        local c
+        read -rp "$(echo -e "${CYAN}请选择 [0-9]: ${NC}")" c
+        case "$c" in
+            1) systemctl start caddy && ok "已启动"; sleep 1 ;;
+            2) systemctl stop caddy && ok "已停止"; sleep 1 ;;
+            3) systemctl restart caddy && ok "已重启"; sleep 1 ;;
+            4) clear; systemctl status caddy --no-pager -l | head -n 30; pause ;;
+            5) clear; caddy_view_log 50; pause ;;
+            6) clear; echo "Ctrl+C 退出"
+               if caddy_load_meta && [[ -s "${CADDY_LOG_DIR}/${CADDY_SVC}.log" ]]; then
+                   tail -f "${CADDY_LOG_DIR}/${CADDY_SVC}.log"
+               else
+                   journalctl -u caddy -f
+               fi ;;
+            7) if caddy_load_meta; then
+                   : > "${CADDY_LOG_DIR}/${CADDY_SVC}.log"
+                   ok "日志已清空"
+               else
+                   err "无配置可清"
+               fi
+               sleep 1 ;;
+            8) apt-get update -y >/dev/null 2>&1
+               apt-get install --only-upgrade -y caddy
+               ok "Caddy 已更新至 $(caddy_version_str)"
+               pause ;;
+            9) caddy_uninstall; pause; return ;;
+            0|"") return ;;
+            *) err "无效"; sleep 1 ;;
+        esac
+    done
+}
+
+# Caddy 反代主入口（未装时显示安装入口，装了显示完整菜单）
+menu_caddy_reverse() {
+    while :; do
+        clear; show_banner
+        sec "Caddy 反代"
+        if ! caddy_installed; then
+            echo -e "  状态: ${RED}未安装${NC}"
+            hr
+            echo "  1) 安装 Caddy"
+            echo "  0) 返回上一页"
+            hr
+            local c
+            read -rp "$(echo -e "${CYAN}请选择 [0-1]: ${NC}")" c
+            case "$c" in
+                1) caddy_install; pause ;;
+                0|"") return ;;
+                *) err "无效"; sleep 1 ;;
+            esac
+        else
+            local active ver domain
+            if systemctl is-active --quiet caddy; then
+                active="${GREEN}running${NC}"
+            else
+                active="${RED}stopped${NC}"
+            fi
+            ver=$(caddy_version_str)
+            if caddy_load_meta; then
+                domain="$CADDY_DOMAIN"
+            else
+                domain="${YELLOW}未配置${NC}"
+            fi
+            echo -e "  caddy: ${ver:-未安装}    状态: ${active}    域名: ${domain}"
+            hr
+            echo "  1) 添加配置（生成 Caddyfile）"
+            echo "  2) 更改配置"
+            echo "  3) 查看配置"
+            echo "  4) Caddy 服务管理 (含卸载)"
+            echo "  0) 返回上一页"
+            hr
+            local c
+            read -rp "$(echo -e "${CYAN}请选择 [0-4]: ${NC}")" c
+            case "$c" in
+                1) caddy_menu_add ;;
+                2) caddy_menu_edit ;;
+                3) caddy_menu_view ;;
+                4) caddy_menu_service ;;
+                0|"") return ;;
+                *) err "无效"; sleep 1 ;;
+            esac
+        fi
+    done
+}
+
+# =============================================================================
+# 6. Docker 管理
 # =============================================================================
 docker_installed() { command -v docker >/dev/null 2>&1; }
 
@@ -1114,7 +1477,7 @@ docker_uninstall() {
 }
 
 # =============================================================================
-# 6. 网络测试
+# 7. 网络测试
 # =============================================================================
 menu_nettest() {
     while :; do
@@ -1160,7 +1523,7 @@ menu_nettest() {
 }
 
 # =============================================================================
-# 7. 系统工具（SSH 管理 + DD）
+# 8. 系统工具（SSH 管理 + DD）
 # =============================================================================
 menu_systools() {
     while :; do
@@ -1553,7 +1916,7 @@ menu_dd() {
 }
 
 # =============================================================================
-# 8. 脚本管理
+# 9. 脚本管理
 # =============================================================================
 menu_script() {
     while :; do
@@ -1619,15 +1982,15 @@ main_menu() {
     while :; do
         clear; show_banner
         echo
-        echo "  1. 系统更新清理"
+        echo "  1. 系统"
         echo
-        echo "  2. 系统信息查询"
+        echo "  2. 基础工具"
         echo
-        echo "  3. 基础工具"
+        echo "  3. 网络优化 (BBR)"
         echo
-        echo "  4. 基础配置"
+        echo "  4. swap 管理"
         echo
-        echo "  5. 网络优化 (BBR)"
+        echo "  5. Caddy 反代"
         echo
         echo "  6. Docker 管理"
         echo
@@ -1643,11 +2006,11 @@ main_menu() {
         local c
         read -rp "$(echo -e "${CYAN}请输入选项 [0-9]: ${NC}")" c
         case "$c" in
-            1) sys_update_clean ;;
-            2) sys_info ;;
-            3) menu_basic_tools ;;
-            4) menu_basic_config ;;
-            5) menu_network_optim ;;
+            1) menu_system ;;
+            2) menu_basic_tools ;;
+            3) menu_network_optim ;;
+            4) cfg_swap ;;
+            5) menu_caddy_reverse ;;
             6) menu_docker ;;
             7) menu_nettest ;;
             8) menu_systools ;;
@@ -1679,8 +2042,13 @@ first_install() {
     echo -e "${GREEN}${left} ${BOLD}${title}${NC}${GREEN} ${right}${NC}"
     echo
     sec "首次运行"
+    echo "  将把 tb 安装到 ${BOLD}${TB_SCRIPT_PATH}${NC}"
+    echo "  以后任意目录输入 ${BOLD}tb${NC} 即可呼出菜单。"
+    echo
+    echo -e "  ${CYAN}本步骤仅复制脚本本身，不会安装其它任何软件${NC}"
+    echo
+    confirm "确认安装？" Y || { warn "已取消"; exit 0; }
     check_debian
-    # 安装到 /usr/local/bin
     if [[ "$0" != "$TB_SCRIPT_PATH" ]] && [[ -f "$0" ]]; then
         install -m 755 "$0" "$TB_SCRIPT_PATH"
         ok "已安装到 $TB_SCRIPT_PATH"

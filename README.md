@@ -12,10 +12,11 @@ wget -O tb https://raw.githubusercontent.com/merlin-node/toolbox/main/tb.sh && c
 
 ## 功能
 
-- 系统更新清理 / 系统信息查询（含可疑进程检测）
+- 系统（更新清理 / 系统信息 / 可疑进程检测 / 时区 / hostname / sudo 用户）
 - 基础工具一键装卸（curl / wget / sudo / nano / htop / tmux / git / 等 12 项）
-- 基础配置（时区 / swap / hostname / sudo 用户）
-- BBR + fq 一键启用
+- 网络优化（BBR + fq 一键启用）
+- swap 管理
+- Caddy 反代（一键生成 Caddyfile / 自动 HTTPS / 服务管理）
 - Docker 管理（容器/镜像/网络/卷交互式管理）
 - 网络测试（yabs / NodeQuality / 三网回程 / IP 质量 / 流媒体解锁 等）
 - SSH 管理（改密 / 改端口 / 密钥登录 / 禁 root / fail2ban）

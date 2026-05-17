@@ -404,7 +404,7 @@ menu_basic_tools() {
             ((i++))
             printf "  ${BOLD}%2d)${NC}  %-10s %s\n" "$i" "$name" "$desc"
         done
-        echo "  ${BOLD} 0)${NC}  返回上一页"
+        echo -e "  ${BOLD} 0)${NC}  返回上一页"
         hr
         local c
         read -rp "$(echo -e "${CYAN}请选择 [0-${#TOOLS[@]}]: ${NC}")" c
@@ -445,8 +445,8 @@ menu_basic_tools() {
 cfg_timezone() {
     clear; show_banner
     sec "时区设置"
-    echo "  当前时区: ${YELLOW}$(timedatectl 2>/dev/null | awk '/Time zone/{print $3, $4, $5}')${NC}"
-    echo "  当前时间: ${YELLOW}$(date)${NC}"
+    echo -e "  当前时区: ${YELLOW}$(timedatectl 2>/dev/null | awk '/Time zone/{print $3, $4, $5}')${NC}"
+    echo -e "  当前时间: ${YELLOW}$(date)${NC}"
     hr
     echo "  1) Asia/Shanghai      上海 (UTC+8)"
     echo "  2) Asia/Hong_Kong     香港 (UTC+8)"
@@ -548,7 +548,7 @@ cfg_swap() {
 cfg_hostname() {
     clear; show_banner
     sec "hostname 修改"
-    echo "  当前主机名: ${YELLOW}$(hostname)${NC}"
+    echo -e "  当前主机名: ${YELLOW}$(hostname)${NC}"
     hr
     local new
     read -rp "$(echo -e "${CYAN}新主机名（回车取消）: ${NC}")" new
@@ -1596,7 +1596,7 @@ ssh_change_port() {
     sec "修改 SSH 端口"
     local cur new
     cur=$(sshd -T 2>/dev/null | awk '/^port /{print $2}' | head -1)
-    echo "  当前端口: ${YELLOW}${cur:-22}${NC}"
+    echo -e "  当前端口: ${YELLOW}${cur:-22}${NC}"
     read -rp "$(echo -e "${CYAN}新端口 (1-65535，建议 10000+): ${NC}")" new
     [[ -z "$new" ]] && return
     if ! [[ "$new" =~ ^[0-9]+$ ]] || (( new < 1 || new > 65535 )); then
@@ -1818,7 +1818,7 @@ menu_dd() {
     warn "DD 重装会清空整台 VPS 的所有数据，无法恢复！"
     warn "重装过程中会断开 SSH，结束后用新密码 + 新端口重连"
     echo
-    echo "  使用 ${BOLD}bin456789/reinstall${NC} 脚本（社区维护，支持系统全）"
+    echo -e "  使用 ${BOLD}bin456789/reinstall${NC} 脚本（社区维护，支持系统全）"
     echo "  https://github.com/bin456789/reinstall"
     hr
     echo "  常见系统："
@@ -2042,8 +2042,8 @@ first_install() {
     echo -e "${GREEN}${left} ${BOLD}${title}${NC}${GREEN} ${right}${NC}"
     echo
     sec "首次运行"
-    echo "  将把 tb 安装到 ${BOLD}${TB_SCRIPT_PATH}${NC}"
-    echo "  以后任意目录输入 ${BOLD}tb${NC} 即可呼出菜单。"
+    echo -e "  将把 tb 安装到 ${BOLD}${TB_SCRIPT_PATH}${NC}"
+    echo -e "  以后任意目录输入 ${BOLD}tb${NC} 即可呼出菜单。"
     echo
     echo -e "  ${CYAN}本步骤仅复制脚本本身，不会安装其它任何软件${NC}"
     echo

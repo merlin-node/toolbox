@@ -889,6 +889,10 @@ caddy_install() {
     apt-get update -y >/dev/null 2>&1
     apt-get install -y caddy
     mkdir -p "$CADDY_LOG_DIR" "$CADDY_META_DIR"
+    # 确保日志目录归 caddy 用户所有
+    if id caddy >/dev/null 2>&1; then
+        chown -R caddy:caddy "$CADDY_LOG_DIR" 2>/dev/null || true
+    fi
     ok "Caddy 安装完成"
 }
 
@@ -969,6 +973,10 @@ EOF
         return 1
     fi
     ok "校验通过"
+    # 修复日志目录权限（caddy 服务以 caddy 用户运行，目录必须归 caddy）
+    if id caddy >/dev/null 2>&1; then
+        chown -R caddy:caddy "$CADDY_LOG_DIR" 2>/dev/null || true
+    fi
     msg "应用配置..."
     systemctl enable caddy >/dev/null 2>&1 || true
     if systemctl is-active --quiet caddy; then

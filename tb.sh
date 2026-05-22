@@ -945,11 +945,6 @@ ${domain} {
     }
 
     reverse_proxy ${ip}:${port} {
-        transport http {
-            read_timeout ${timeout}s
-            write_timeout ${timeout}s
-        }
-
         header_up Host {upstream_hostport}
         header_up X-Real-IP {remote_host}
         header_up X-Forwarded-For {remote_host}

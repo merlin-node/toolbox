@@ -2054,7 +2054,7 @@ menu_fail2ban() {
 
 f2b_install() {
     msg "安装 fail2ban..."
-    apt-get install -y fail2ban
+    apt-get install -y fail2ban python3-systemd
     cat > /etc/fail2ban/jail.local << EOF
 [DEFAULT]
 bantime = 1h

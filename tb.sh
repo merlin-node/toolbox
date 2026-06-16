@@ -944,6 +944,19 @@ ${domain} {
         }
     }
 
+    # 拦截隐藏文件/目录（.git .env .ssh 等），放行证书验证用的 .well-known
+    @hidden {
+        path /.*
+        not path /.well-known/*
+    }
+    respond @hidden 404
+
+    # 拦截常见敏感后缀文件
+    @sensitive {
+        path *.sql *.bak *.log *.ini *.conf *.yml *.yaml *.env
+    }
+    respond @sensitive 404
+
     reverse_proxy ${ip}:${port} {
         header_up Host {upstream_hostport}
         header_up X-Real-IP {remote_host}
@@ -2127,6 +2140,20 @@ f2b_uninstall() {
 menu_dd() {
     clear; show_banner
     sec "${RED}DD 重装系统${NC}"
+
+    # 虚拟化检测：OpenVZ / LXC 这类容器不能 DD，提前拦下
+    local virt=""
+    if command -v systemd-detect-virt >/dev/null 2>&1; then
+        virt=$(systemd-detect-virt 2>/dev/null || true)
+    fi
+    if [[ "$virt" == "openvz" || "$virt" == "lxc" ]]; then
+        err "检测到当前为 ${BOLD}${virt}${NC} 容器，无法进行 DD 重装。"
+        warn "OpenVZ / LXC 共享宿主内核，没有独立磁盘，reinstall 也无法工作。"
+        warn "如需换系统，请联系服务商在面板里重装。"
+        pause
+        return
+    fi
+
     warn "DD 重装会清空整台 VPS 的所有数据，无法恢复！"
     warn "重装过程中会断开 SSH，结束后用新密码 + 新端口重连"
     echo
@@ -2167,6 +2194,21 @@ menu_dd() {
         0|"") return ;;
         *) err "无效"; sleep 1; return ;;
     esac
+
+    # 环境提示（不拦截，仅提醒易踩坑的两种情况）
+    local mem_mb has_v4=""
+    mem_mb=$(free -m | awk '/^Mem:/ {print $2}')
+    has_v4=$(ip -4 addr show scope global 2>/dev/null | awk '/inet/ {print; exit}')
+    if [[ -z "$has_v4" ]]; then
+        warn "未检测到公网 IPv4，本机疑似纯 IPv6。"
+        warn "reinstall 拉取镜像与装机后换源都需走 IPv6，请确保网络可用，否则可能失败。"
+        echo
+    fi
+    if [[ -n "$mem_mb" ]] && (( mem_mb < 512 )); then
+        warn "本机内存仅 ${mem_mb}MB，netboot 安装模式可能内存不足。"
+        warn "若装机失败，建议改用 DD cloud image 模式（reinstall 会自动尝试）。"
+        echo
+    fi
 
     # 询问密码（必填，隐藏输入，两次核对）
     echo
@@ -2218,8 +2260,15 @@ menu_dd() {
 
     msg "下载 reinstall 脚本..."
     cd /root 2>/dev/null || cd /tmp
-    curl -fsSL -O https://raw.githubusercontent.com/bin456789/reinstall/main/reinstall.sh \
-        || wget -O reinstall.sh https://raw.githubusercontent.com/bin456789/reinstall/main/reinstall.sh
+    rm -f reinstall.sh
+    curl -fsSL --connect-timeout 10 -O https://raw.githubusercontent.com/bin456789/reinstall/main/reinstall.sh \
+        || curl -fsSL --connect-timeout 10 -o reinstall.sh https://cdn.jsdelivr.net/gh/bin456789/reinstall@main/reinstall.sh \
+        || wget --timeout=15 -O reinstall.sh https://raw.githubusercontent.com/bin456789/reinstall/main/reinstall.sh
+    if [[ ! -s reinstall.sh ]]; then
+        err "reinstall 脚本下载失败（GitHub 与 jsdelivr 均不可达），请检查网络后重试"
+        pause
+        return
+    fi
     chmod +x reinstall.sh
 
     msg "配置 reinstall（这一步不会真正写盘，只是设置引导项）..."

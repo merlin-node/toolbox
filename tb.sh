@@ -741,19 +741,47 @@ cfg_hostname() {
     clear; show_banner
     sec "hostname 修改"
     echo -e "  当前主机名: ${YELLOW}$(hostname)${NC}"
+    echo -e "  ${CYAN}只能用字母、数字、- 和 . ，每段不能以 - 开头或结尾，总长不超过 63${NC}"
     hr
-    local new
+    local new short line tmp
     read -rp "$(echo -e "${CYAN}新主机名（回车取消）: ${NC}")" new
     [[ -z "$new" ]] && return
-    local old
-    old=$(hostname)
-    hostnamectl set-hostname "$new"
-    # 同步 /etc/hosts
-    if grep -q "127.0.1.1" /etc/hosts; then
-        sed -i "s/127.0.1.1.*/127.0.1.1\t$new/" /etc/hosts
-    else
-        echo -e "127.0.1.1\t$new" >> /etc/hosts
+    local label='[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?'
+    if [[ ! "$new" =~ ^${label}(\.${label})*$ ]] || (( ${#new} > 63 )); then
+        err "主机名不合法，未改动"
+        return
     fi
+    if [[ "$new" == "$(hostname)" ]]; then
+        warn "与当前主机名相同，无需修改"
+        return
+    fi
+    if ! hostnamectl set-hostname "$new"; then
+        err "hostnamectl 设置失败，未改动 /etc/hosts"
+        return
+    fi
+
+    # 同步 /etc/hosts：只替换第一条未注释的 127.0.1.1，没有就追加
+    short="${new%%.*}"
+    line="127.0.1.1"$'\t'"$new"
+    [[ "$short" != "$new" ]] && line+=" $short"
+    tmp=$(mktemp) || { warn "无法创建临时文件，请手动更新 /etc/hosts"; return; }
+    if awk -v line="$line" '
+        !done && $1 == "127.0.1.1" { print line; done = 1; next }
+        { print }
+        END { if (!done) print line }
+    ' /etc/hosts > "$tmp"; then
+        cat "$tmp" > /etc/hosts
+    else
+        warn "/etc/hosts 更新失败，请手动检查"
+    fi
+    rm -f "$tmp"
+
+    # cloud-init 会在重启时把主机名改回去，有它才写入保留设置
+    if [[ -d /etc/cloud/cloud.cfg.d ]]; then
+        printf 'preserve_hostname: true\n' > /etc/cloud/cloud.cfg.d/99-tb-preserve-hostname.cfg
+        msg "检测到 cloud-init，已设置重启后保留主机名"
+    fi
+
     ok "主机名已改为 $new"
     warn "重新登录 SSH 后命令提示符才会更新"
 }
@@ -2137,6 +2165,33 @@ f2b_uninstall() {
     ok "fail2ban 已卸载"
 }
 
+# 随机 root 密码（与 Shinyuz Tools 的 generate_dd_password 相同）
+dd_gen_password() {
+    local allowed_chars='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz013456789!@#$%&*+_=.?-'
+    local password
+    while true; do
+        password="$(LC_ALL=C tr -dc "$allowed_chars" < /dev/urandom | head -c 16)"
+        [[ ${#password} -eq 16 && "$password" != *2* && "$password" =~ [^[:alnum:]] ]] && {
+            printf '%s' "$password"
+            return
+        }
+    done
+}
+
+# 下载重装引擎：dd_fetch 文件名 URL...（依次尝试，成功返回 0）
+dd_fetch() {
+    local file="$1" url
+    shift
+    rm -f "$file"
+    for url in "$@"; do
+        curl -fsSL --connect-timeout 10 -o "$file" "$url" 2>/dev/null && [[ -s "$file" ]] && break
+        wget -q --timeout=15 -O "$file" "$url" 2>/dev/null && [[ -s "$file" ]] && break
+        rm -f "$file"
+    done
+    [[ -s "$file" ]] || return 1
+    chmod +x "$file"
+}
+
 menu_dd() {
     clear; show_banner
     sec "${RED}DD 重装系统${NC}"
@@ -2148,78 +2203,119 @@ menu_dd() {
     fi
     if [[ "$virt" == "openvz" || "$virt" == "lxc" ]]; then
         err "检测到当前为 ${BOLD}${virt}${NC} 容器，无法进行 DD 重装。"
-        warn "OpenVZ / LXC 共享宿主内核，没有独立磁盘，reinstall 也无法工作。"
+        warn "OpenVZ / LXC 共享宿主内核，没有独立磁盘，DD 脚本无法工作。"
         warn "如需换系统，请联系服务商在面板里重装。"
         pause
         return
     fi
 
     warn "DD 重装会清空整台 VPS 的所有数据，无法恢复！"
-    warn "重装过程中会断开 SSH，结束后用新密码 + 新端口重连"
-    echo
-    echo -e "  使用 ${BOLD}bin456789/reinstall${NC} 脚本（社区维护，支持系统全）"
-    echo "  https://github.com/bin456789/reinstall"
+    warn "重装过程中会断开 SSH，结束后用新密码重连（用户 root，SSH 端口固定 22）"
     hr
-    echo "  常见系统："
-    echo "   1) Debian 13"
-    echo "   2) Debian 12"
-    echo "   3) Ubuntu 24.04"
-    echo "   4) Ubuntu 22.04"
-    echo "   5) AlmaLinux 9"
-    echo "   6) Rocky Linux 9"
-    echo "   7) CentOS 9 Stream"
-    echo "   8) Fedora 41"
-    echo "   9) Alpine 3.20"
-    echo "  10) 其它 (手动输入: 系统名 + 版本)"
+    echo "   1) DD纯净版  (bin456789/reinstall，支持系统全)"
+    echo "   2) DD最强版  (leitbogioro/InstallNET，纯净版装完连不上时用)"
     echo "   0) 返回"
     hr
-    local c sys
-    read -rp "$(echo -e "${CYAN}请选择 [0-10]: ${NC}")" c
+    local engine c
+    read -rp "$(echo -e "${CYAN}请选择 [0-2]: ${NC}")" c
     case "$c" in
-        1)  sys="debian 13" ;;
-        2)  sys="debian 12" ;;
-        3)  sys="ubuntu 24.04" ;;
-        4)  sys="ubuntu 22.04" ;;
-        5)  sys="alma 9" ;;
-        6)  sys="rocky 9" ;;
-        7)  sys="centos 9" ;;
-        8)  sys="fedora 41" ;;
-        9)  sys="alpine 3.20" ;;
-        10)
-            read -rp "  系统名 (如 debian / ubuntu / arch / windows): " os
-            read -rp "  版本   (如 13 / 24.04，留空表示无版本): " ver
-            [[ -z "$os" ]] && return
-            sys="$os $ver"
-            ;;
+        1) engine="reinstall" ;;
+        2) engine="installnet" ;;
         0|"") return ;;
         *) err "无效"; sleep 1; return ;;
     esac
 
-    # 环境提示（不拦截，仅提醒易踩坑的两种情况）
+    # 选择系统（os / ver 分开存，传参时不再依赖分词）
+    local os="" ver=""
+    hr
+    echo "  常见系统："
+    if [[ "$engine" == "reinstall" ]]; then
+        echo "   1) Debian 13"
+        echo "   2) Debian 12"
+        echo "   3) Ubuntu 24.04"
+        echo "   4) Ubuntu 22.04"
+        echo "   5) AlmaLinux 9"
+        echo "   6) Rocky Linux 9"
+        echo "   7) CentOS 9 Stream"
+        echo "   8) Fedora 41"
+        echo "   9) Alpine 3.20"
+        echo "  10) 其它 (手动输入: 系统名 + 版本)"
+        echo "   0) 返回"
+        hr
+        read -rp "$(echo -e "${CYAN}请选择 [0-10]: ${NC}")" c
+        case "$c" in
+            1)  os=debian; ver=13 ;;
+            2)  os=debian; ver=12 ;;
+            3)  os=ubuntu; ver=24.04 ;;
+            4)  os=ubuntu; ver=22.04 ;;
+            5)  os=alma;   ver=9 ;;
+            6)  os=rocky;  ver=9 ;;
+            7)  os=centos; ver=9 ;;
+            8)  os=fedora; ver=41 ;;
+            9)  os=alpine; ver=3.20 ;;
+            10)
+                read -rp "  系统名 (如 debian / ubuntu / arch / windows): " os
+                read -rp "  版本   (如 13 / 24.04，留空表示无版本): " ver
+                ;;
+            0|"") return ;;
+            *) err "无效"; sleep 1; return ;;
+        esac
+    else
+        echo "   1) Debian 13"
+        echo "   2) Debian 12"
+        echo "   3) Ubuntu 24.04"
+        echo "   4) Ubuntu 22.04"
+        echo "   5) 其它 (手动输入: 系统名 + 版本)"
+        echo "   0) 返回"
+        hr
+        read -rp "$(echo -e "${CYAN}请选择 [0-5]: ${NC}")" c
+        case "$c" in
+            1) os=debian; ver=13 ;;
+            2) os=debian; ver=12 ;;
+            3) os=ubuntu; ver=24.04 ;;
+            4) os=ubuntu; ver=22.04 ;;
+            5)
+                read -rp "  系统名 (如 debian / ubuntu / alpine): " os
+                read -rp "  版本   (如 12 / 24.04): " ver
+                ;;
+            0|"") return ;;
+            *) err "无效"; sleep 1; return ;;
+        esac
+    fi
+    [[ -z "$os" ]] && return
+    if [[ ! "$os" =~ ^[A-Za-z0-9._-]+$ || ! "$ver" =~ ^[A-Za-z0-9._-]*$ ]]; then
+        err "系统名 / 版本含非法字符"
+        pause
+        return
+    fi
+
+    # 环境提示（不拦截，仅提醒易踩坑的情况）
     local mem_mb has_v4=""
     mem_mb=$(free -m | awk '/^Mem:/ {print $2}')
     has_v4=$(ip -4 addr show scope global 2>/dev/null | awk '/inet/ {print; exit}')
+    echo
     if [[ -z "$has_v4" ]]; then
         warn "未检测到公网 IPv4，本机疑似纯 IPv6。"
-        warn "reinstall 拉取镜像与装机后换源都需走 IPv6，请确保网络可用，否则可能失败。"
+        warn "拉取镜像与装机后换源都需走 IPv6，请确保网络可用，否则可能失败。"
         echo
     fi
-    if [[ -n "$mem_mb" ]] && (( mem_mb < 512 )); then
+    if [[ "$engine" == "reinstall" && -n "$mem_mb" ]] && (( mem_mb < 512 )); then
         warn "本机内存仅 ${mem_mb}MB，netboot 安装模式可能内存不足。"
         warn "若装机失败，建议改用 DD cloud image 模式（reinstall 会自动尝试）。"
         echo
     fi
 
-    # 询问密码（必填，隐藏输入，两次核对）
-    echo
-    echo -e "  ${CYAN}新 root 密码${NC}（必填，输入时不显示）"
-    local newpw pw2
+    # 询问密码（回车随机生成；手动输入则隐藏并两次核对）
+    echo -e "  ${CYAN}新 root 密码${NC}（输入时不显示，直接回车随机生成）"
+    local newpw pw2 pw_random=0
     while :; do
         read -rsp "  密码: " newpw
         echo
         if [[ -z "$newpw" ]]; then
-            err "密码不能为空"
-            continue
+            newpw=$(dd_gen_password)
+            pw_random=1
+            echo -e "  已随机生成 root 密码: ${YELLOW}${newpw}${NC}"
+            break
         fi
         read -rsp "  再输一次: " pw2
         echo
@@ -2229,65 +2325,76 @@ menu_dd() {
         err "两次输入不一致，请重新输入"
     done
 
-    # 询问 SSH 端口（必填）
-    echo
-    echo -e "  ${CYAN}新系统的 SSH 端口${NC}（必填，1-65535）"
-    local newport
-    while :; do
-        read -rp "  端口: " newport
-        if [[ -z "$newport" ]]; then
-            err "端口不能为空"
-            continue
-        fi
-        if ! [[ "$newport" =~ ^[0-9]+$ ]] || (( newport < 1 || newport > 65535 )); then
-            err "端口无效（必须是 1-65535 的数字）"
-            continue
-        fi
-        break
-    done
+    # SSH 端口固定 22
+    local newport=22
 
     # 最终确认（密码用星号显示，不打印明文）
-    local pw_mask pw_len
+    local pw_mask pw_len engine_name
     pw_len=${#newpw}
     pw_mask=$(printf '%*s' "$pw_len" '' | tr ' ' '*')
+    if [[ "$engine" == "reinstall" ]]; then
+        engine_name="DD纯净版 (bin456789/reinstall)"
+    else
+        engine_name="DD最强版 (leitbogioro/InstallNET)"
+    fi
     echo
     hr
-    echo -e "  即将重装为:   ${BOLD}${sys}${NC}"
-    echo -e "  新 root 密码: ${BOLD}${pw_mask}${NC} (${pw_len} 位)"
-    echo -e "  新 SSH 端口:  ${BOLD}${newport}${NC}"
+    echo -e "  重装引擎:     ${BOLD}${engine_name}${NC}"
+    echo -e "  即将重装为:   ${BOLD}${os} ${ver}${NC}"
+    if (( pw_random )); then
+        echo -e "  新 root 密码: ${YELLOW}${newpw}${NC}"
+    else
+        echo -e "  新 root 密码: ${BOLD}${pw_mask}${NC} (${pw_len} 位)"
+    fi
+    echo -e "  新 SSH 端口:  ${BOLD}${newport}${NC} (固定)"
     hr
     confirm "确认开始 DD 重装？" N || { warn "已取消"; return; }
 
-    msg "下载 reinstall 脚本..."
     cd /root 2>/dev/null || cd /tmp
-    rm -f reinstall.sh
-    curl -fsSL --connect-timeout 10 -O https://raw.githubusercontent.com/bin456789/reinstall/main/reinstall.sh \
-        || curl -fsSL --connect-timeout 10 -o reinstall.sh https://cdn.jsdelivr.net/gh/bin456789/reinstall@main/reinstall.sh \
-        || wget --timeout=15 -O reinstall.sh https://raw.githubusercontent.com/bin456789/reinstall/main/reinstall.sh
-    if [[ ! -s reinstall.sh ]]; then
-        err "reinstall 脚本下载失败（GitHub 与 jsdelivr 均不可达），请检查网络后重试"
+    local -a args
+    local file
+    msg "下载 ${engine_name} 脚本..."
+    if [[ "$engine" == "reinstall" ]]; then
+        file="reinstall.sh"
+        dd_fetch "$file" \
+            https://raw.githubusercontent.com/bin456789/reinstall/main/reinstall.sh \
+            https://cdn.jsdelivr.net/gh/bin456789/reinstall@main/reinstall.sh
+        args=("$os")
+        [[ -n "$ver" ]] && args+=("$ver")
+        args+=(--password "$newpw" --ssh-port "$newport")
+    else
+        file="InstallNET.sh"
+        dd_fetch "$file" \
+            https://raw.githubusercontent.com/leitbogioro/Tools/master/Linux_reinstall/InstallNET.sh \
+            https://cdn.jsdelivr.net/gh/leitbogioro/Tools@master/Linux_reinstall/InstallNET.sh
+        args=("-${os}")
+        [[ -n "$ver" ]] && args+=("$ver")
+        args+=(-pwd "$newpw" -port "$newport")
+    fi
+    if [[ ! -s "$file" ]]; then
+        err "${engine_name} 脚本下载失败（GitHub 与 jsdelivr 均不可达），请检查网络后重试"
         pause
         return
     fi
-    chmod +x reinstall.sh
 
-    msg "配置 reinstall（这一步不会真正写盘，只是设置引导项）..."
+    msg "配置重装（这一步不会真正写盘，只是设置引导项）..."
     sleep 2
-    bash reinstall.sh $sys --password "$newpw" --ssh-port "$newport"
+    bash "$file" "${args[@]}"
     local rc=$?
+    newpw=""; pw2=""; args=()
     echo
     if (( rc != 0 )); then
-        err "reinstall 配置失败，请检查上方输出"
+        err "重装配置失败，请检查上方输出"
         pause
         return
     fi
 
     hr
-    ok "reinstall 已配置完成"
+    ok "重装已配置完成"
     echo
     warn "重要：${BOLD}现在系统还没有真正 DD${NC}"
     warn "只有重启后，机器会从安装介质引导，那一刻才开始擦盘重装"
-    warn "重启后 5-15 分钟内不要操作，等装完用新端口 ${newport} 重连"
+    warn "重启后 5-15 分钟内不要操作，等装完用 root + 新密码、端口 ${newport} 重连"
     echo
     if confirm "现在立即重启开始 DD？" N; then
         msg "3 秒后重启..."

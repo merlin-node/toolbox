@@ -2178,232 +2178,206 @@ dd_gen_password() {
     done
 }
 
-# 下载重装引擎：dd_fetch 文件名 URL...（依次尝试，成功返回 0）
+# 下载脚本：dd_fetch 文件名 URL...（依次尝试，成功返回 0）
+# 修复原版：不再跳过证书校验；加备用源；拒绝 HTML 错误页
 dd_fetch() {
     local file="$1" url
     shift
     rm -f "$file"
     for url in "$@"; do
-        curl -fsSL --connect-timeout 10 -o "$file" "$url" 2>/dev/null && [[ -s "$file" ]] && break
-        wget -q --timeout=15 -O "$file" "$url" 2>/dev/null && [[ -s "$file" ]] && break
+        if curl -fsSL --connect-timeout 10 --retry 2 -o "$file" "$url" 2>/dev/null \
+            || wget -q --timeout=15 --tries=2 -O "$file" "$url" 2>/dev/null; then
+            if [[ -s "$file" ]] && ! head -c 512 "$file" | grep -qiE '<!doctype|<html'; then
+                chmod +x "$file"
+                return 0
+            fi
+        fi
         rm -f "$file"
     done
-    [[ -s "$file" ]] || return 1
-    chmod +x "$file"
+    return 1
+}
+
+DD_URL_REINSTALL=(
+    https://raw.githubusercontent.com/bin456789/reinstall/main/reinstall.sh
+    https://cdn.jsdelivr.net/gh/bin456789/reinstall@main/reinstall.sh
+)
+DD_URL_INSTALLNET=(
+    https://raw.githubusercontent.com/leitbogioro/Tools/master/Linux_reinstall/InstallNET.sh
+    https://cdn.jsdelivr.net/gh/leitbogioro/Tools@master/Linux_reinstall/InstallNET.sh
+)
+DD_URL_OSMUTATION=(
+    https://raw.githubusercontent.com/LloydAsp/OsMutation/main/OsMutation.sh
+    https://cdn.jsdelivr.net/gh/LloydAsp/OsMutation@main/OsMutation.sh
+)
+
+# 开始重装：$1 = reinstall | installnet，$2 = 系统名，$3 = 版本，$4 = 显示名
+dd_start_reinstall() {
+    local engine="$1" os_name="$2" os_version="$3" display_name="$4"
+    local root_password confirm_password file rc
+
+    clear; show_banner
+    sec "$display_name"
+    echo
+    read -rsp "请输入 root 密码（直接回车随机生成）: " root_password
+    if [[ -z "$root_password" ]]; then
+        root_password="$(dd_gen_password)"
+        echo
+        echo
+        echo -e "已随机生成 root 密码: ${YELLOW}${root_password}${NC}"
+    else
+        echo
+        echo
+        read -rsp "请再次输入 root 密码: " confirm_password
+        echo
+        if [[ "$root_password" != "$confirm_password" ]]; then
+            err "两次输入的密码不一致"
+            root_password=""; confirm_password=""
+            pause
+            return 1
+        fi
+    fi
+
+    echo
+    warn "即将重装为 $display_name"
+    warn "用户名固定为 root，SSH端口固定为 22"
+    echo
+
+    # 修复原版：固定下载到 /root，且 InstallNET 不再存成 reinstall.sh
+    cd /root 2>/dev/null || cd /tmp
+    if [[ "$engine" == "reinstall" ]]; then
+        file="reinstall.sh"
+        dd_fetch "$file" "${DD_URL_REINSTALL[@]}"
+    else
+        file="InstallNET.sh"
+        dd_fetch "$file" "${DD_URL_INSTALLNET[@]}"
+    fi
+    if [[ ! -s "$file" ]]; then
+        err "${file} 下载失败"
+        root_password=""; confirm_password=""
+        pause
+        return 1
+    fi
+
+    if [[ "$engine" == "reinstall" ]]; then
+        (
+            set -o pipefail
+            bash "$file" "$os_name" "$os_version" \
+                --username root \
+                --password "$root_password" \
+                --ssh-port 22 2>&1 | awk '
+                    function out(text) {
+                        printf "%s\r\n", text
+                    }
+                    { sub(/\r$/, "") }
+                    /警告：重装会清除主硬盘的所有数据，包括所有分区！/ { out($0); out(""); next }
+                    /^重启后开始重装。$/ {
+                        out("重启后开始重装，或者现在运行 \"bash /root/reinstall.sh reset\" 以取消重装！")
+                        out("")
+                        out("输入“reboot”重启！")
+                        out("")
+                        skip_cn=1
+                        final_message=1
+                        next
+                    }
+                    skip_cn && /^或者现在运行 .* 以取消重装。$/ { skip_cn=0; next }
+                    /Warning: Reinstalling will erase all data on the main disk, including all partitions!/ { next }
+                    /Reboot to start the reinstallation./ { next }
+                    /Or run ".*reset" now to cancel the reinstallation./ { next }
+                    final_message && /^[[:space:]]*$/ { next }
+                    { out($0) }
+                '
+        )
+        rc=$?
+    else
+        bash "$file" "-${os_name}" "$os_version" \
+            -pwd "$root_password" \
+            -port 22
+        rc=$?
+        echo
+    fi
+    root_password=""; confirm_password=""
+
+    # 修复原版：InstallNET 失败时不再直接 exit 0
+    if (( rc == 0 )); then
+        exit 0
+    fi
+    err "重装环境准备失败"
+    pause
+    return "$rc"
+}
+
+# Linux 系统列表：$1 = reinstall | installnet
+dd_linux_menu() {
+    local engine="$1" title c
+    if [[ "$engine" == "reinstall" ]]; then
+        title="DD纯净版"
+    else
+        title="DD最强版"
+    fi
+    while :; do
+        clear; show_banner
+        sec "$title"
+        echo "  1) Debian 12"
+        echo "  2) Debian 13"
+        echo "  3) Ubuntu 24.04"
+        echo "  4) Ubuntu 26.04"
+        echo "  5) Alpine 3.23"
+        echo "  6) Alpine 3.24"
+        echo "  0) 返回上一页"
+        hr
+        read -rp "$(echo -e "${CYAN}请选择 [0-6]: ${NC}")" c
+        case "$c" in
+            1) dd_start_reinstall "$engine" debian 12    "Debian 12" ;;
+            2) dd_start_reinstall "$engine" debian 13    "Debian 13" ;;
+            3) dd_start_reinstall "$engine" ubuntu 24.04 "Ubuntu 24.04" ;;
+            4) dd_start_reinstall "$engine" ubuntu 26.04 "Ubuntu 26.04" ;;
+            5) dd_start_reinstall "$engine" alpine 3.23  "Alpine 3.23" ;;
+            6) dd_start_reinstall "$engine" alpine 3.24  "Alpine 3.24" ;;
+            0|"") return ;;
+            *) err "无效"; sleep 1 ;;
+        esac
+    done
+}
+
+# Nat-DD：OpenVZ / LXC / NAT 小鸡用
+dd_nat_reinstall() {
+    clear; show_banner
+    sec "Nat-DD版"
+    echo
+    # 修复原版：curl 没加 -f，下载失败拿到错误页也会执行
+    cd /root 2>/dev/null || cd /tmp
+    if ! dd_fetch OsMutation.sh "${DD_URL_OSMUTATION[@]}"; then
+        err "OsMutation.sh 下载失败"
+        pause
+        return 1
+    fi
+    if bash OsMutation.sh; then
+        ok "Nat DD 脚本执行完成"
+    else
+        err "Nat DD 脚本执行失败"
+    fi
+    pause
 }
 
 menu_dd() {
-    clear; show_banner
-    sec "${RED}DD 重装系统${NC}"
-
-    # 虚拟化检测：OpenVZ / LXC 这类容器不能 DD，提前拦下
-    local virt=""
-    if command -v systemd-detect-virt >/dev/null 2>&1; then
-        virt=$(systemd-detect-virt 2>/dev/null || true)
-    fi
-    if [[ "$virt" == "openvz" || "$virt" == "lxc" ]]; then
-        err "检测到当前为 ${BOLD}${virt}${NC} 容器，无法进行 DD 重装。"
-        warn "OpenVZ / LXC 共享宿主内核，没有独立磁盘，DD 脚本无法工作。"
-        warn "如需换系统，请联系服务商在面板里重装。"
-        pause
-        return
-    fi
-
-    warn "DD 重装会清空整台 VPS 的所有数据，无法恢复！"
-    warn "重装过程中会断开 SSH，结束后用新密码重连（用户 root，SSH 端口固定 22）"
-    hr
-    echo "   1) DD纯净版  (bin456789/reinstall，支持系统全)"
-    echo "   2) DD最强版  (leitbogioro/InstallNET，纯净版装完连不上时用)"
-    echo "   0) 返回"
-    hr
-    local engine c
-    read -rp "$(echo -e "${CYAN}请选择 [0-2]: ${NC}")" c
-    case "$c" in
-        1) engine="reinstall" ;;
-        2) engine="installnet" ;;
-        0|"") return ;;
-        *) err "无效"; sleep 1; return ;;
-    esac
-
-    # 选择系统（os / ver 分开存，传参时不再依赖分词）
-    local os="" ver=""
-    hr
-    echo "  常见系统："
-    if [[ "$engine" == "reinstall" ]]; then
-        echo "   1) Debian 13"
-        echo "   2) Debian 12"
-        echo "   3) Ubuntu 24.04"
-        echo "   4) Ubuntu 22.04"
-        echo "   5) AlmaLinux 9"
-        echo "   6) Rocky Linux 9"
-        echo "   7) CentOS 9 Stream"
-        echo "   8) Fedora 41"
-        echo "   9) Alpine 3.20"
-        echo "  10) 其它 (手动输入: 系统名 + 版本)"
-        echo "   0) 返回"
-        hr
-        read -rp "$(echo -e "${CYAN}请选择 [0-10]: ${NC}")" c
-        case "$c" in
-            1)  os=debian; ver=13 ;;
-            2)  os=debian; ver=12 ;;
-            3)  os=ubuntu; ver=24.04 ;;
-            4)  os=ubuntu; ver=22.04 ;;
-            5)  os=alma;   ver=9 ;;
-            6)  os=rocky;  ver=9 ;;
-            7)  os=centos; ver=9 ;;
-            8)  os=fedora; ver=41 ;;
-            9)  os=alpine; ver=3.20 ;;
-            10)
-                read -rp "  系统名 (如 debian / ubuntu / arch / windows): " os
-                read -rp "  版本   (如 13 / 24.04，留空表示无版本): " ver
-                ;;
-            0|"") return ;;
-            *) err "无效"; sleep 1; return ;;
-        esac
-    else
-        echo "   1) Debian 13"
-        echo "   2) Debian 12"
-        echo "   3) Ubuntu 24.04"
-        echo "   4) Ubuntu 22.04"
-        echo "   5) 其它 (手动输入: 系统名 + 版本)"
-        echo "   0) 返回"
-        hr
-        read -rp "$(echo -e "${CYAN}请选择 [0-5]: ${NC}")" c
-        case "$c" in
-            1) os=debian; ver=13 ;;
-            2) os=debian; ver=12 ;;
-            3) os=ubuntu; ver=24.04 ;;
-            4) os=ubuntu; ver=22.04 ;;
-            5)
-                read -rp "  系统名 (如 debian / ubuntu / alpine): " os
-                read -rp "  版本   (如 12 / 24.04): " ver
-                ;;
-            0|"") return ;;
-            *) err "无效"; sleep 1; return ;;
-        esac
-    fi
-    [[ -z "$os" ]] && return
-    if [[ ! "$os" =~ ^[A-Za-z0-9._-]+$ || ! "$ver" =~ ^[A-Za-z0-9._-]*$ ]]; then
-        err "系统名 / 版本含非法字符"
-        pause
-        return
-    fi
-
-    # 环境提示（不拦截，仅提醒易踩坑的情况）
-    local mem_mb has_v4=""
-    mem_mb=$(free -m | awk '/^Mem:/ {print $2}')
-    has_v4=$(ip -4 addr show scope global 2>/dev/null | awk '/inet/ {print; exit}')
-    echo
-    if [[ -z "$has_v4" ]]; then
-        warn "未检测到公网 IPv4，本机疑似纯 IPv6。"
-        warn "拉取镜像与装机后换源都需走 IPv6，请确保网络可用，否则可能失败。"
-        echo
-    fi
-    if [[ "$engine" == "reinstall" && -n "$mem_mb" ]] && (( mem_mb < 512 )); then
-        warn "本机内存仅 ${mem_mb}MB，netboot 安装模式可能内存不足。"
-        warn "若装机失败，建议改用 DD cloud image 模式（reinstall 会自动尝试）。"
-        echo
-    fi
-
-    # 询问密码（回车随机生成；手动输入则隐藏并两次核对）
-    echo -e "  ${CYAN}新 root 密码${NC}（输入时不显示，直接回车随机生成）"
-    local newpw pw2 pw_random=0
+    local c
     while :; do
-        read -rsp "  密码: " newpw
-        echo
-        if [[ -z "$newpw" ]]; then
-            newpw=$(dd_gen_password)
-            pw_random=1
-            echo -e "  已随机生成 root 密码: ${YELLOW}${newpw}${NC}"
-            break
-        fi
-        read -rsp "  再输一次: " pw2
-        echo
-        if [[ "$newpw" == "$pw2" ]]; then
-            break
-        fi
-        err "两次输入不一致，请重新输入"
+        clear; show_banner
+        sec "${RED}DD 重装系统${NC}"
+        echo "  1) DD纯净版"
+        echo "  2) DD最强版"
+        echo "  3) Nat-DD版"
+        echo "  0) 返回上一页"
+        hr
+        read -rp "$(echo -e "${CYAN}请选择 [0-3]: ${NC}")" c
+        case "$c" in
+            1) dd_linux_menu reinstall ;;
+            2) dd_linux_menu installnet ;;
+            3) dd_nat_reinstall ;;
+            0|"") return ;;
+            *) err "无效"; sleep 1 ;;
+        esac
     done
-
-    # SSH 端口固定 22
-    local newport=22
-
-    # 最终确认（密码用星号显示，不打印明文）
-    local pw_mask pw_len engine_name
-    pw_len=${#newpw}
-    pw_mask=$(printf '%*s' "$pw_len" '' | tr ' ' '*')
-    if [[ "$engine" == "reinstall" ]]; then
-        engine_name="DD纯净版 (bin456789/reinstall)"
-    else
-        engine_name="DD最强版 (leitbogioro/InstallNET)"
-    fi
-    echo
-    hr
-    echo -e "  重装引擎:     ${BOLD}${engine_name}${NC}"
-    echo -e "  即将重装为:   ${BOLD}${os} ${ver}${NC}"
-    if (( pw_random )); then
-        echo -e "  新 root 密码: ${YELLOW}${newpw}${NC}"
-    else
-        echo -e "  新 root 密码: ${BOLD}${pw_mask}${NC} (${pw_len} 位)"
-    fi
-    echo -e "  新 SSH 端口:  ${BOLD}${newport}${NC} (固定)"
-    hr
-    confirm "确认开始 DD 重装？" N || { warn "已取消"; return; }
-
-    cd /root 2>/dev/null || cd /tmp
-    local -a args
-    local file
-    msg "下载 ${engine_name} 脚本..."
-    if [[ "$engine" == "reinstall" ]]; then
-        file="reinstall.sh"
-        dd_fetch "$file" \
-            https://raw.githubusercontent.com/bin456789/reinstall/main/reinstall.sh \
-            https://cdn.jsdelivr.net/gh/bin456789/reinstall@main/reinstall.sh
-        args=("$os")
-        [[ -n "$ver" ]] && args+=("$ver")
-        args+=(--password "$newpw" --ssh-port "$newport")
-    else
-        file="InstallNET.sh"
-        dd_fetch "$file" \
-            https://raw.githubusercontent.com/leitbogioro/Tools/master/Linux_reinstall/InstallNET.sh \
-            https://cdn.jsdelivr.net/gh/leitbogioro/Tools@master/Linux_reinstall/InstallNET.sh
-        args=("-${os}")
-        [[ -n "$ver" ]] && args+=("$ver")
-        args+=(-pwd "$newpw" -port "$newport")
-    fi
-    if [[ ! -s "$file" ]]; then
-        err "${engine_name} 脚本下载失败（GitHub 与 jsdelivr 均不可达），请检查网络后重试"
-        pause
-        return
-    fi
-
-    msg "配置重装（这一步不会真正写盘，只是设置引导项）..."
-    sleep 2
-    bash "$file" "${args[@]}"
-    local rc=$?
-    newpw=""; pw2=""; args=()
-    echo
-    if (( rc != 0 )); then
-        err "重装配置失败，请检查上方输出"
-        pause
-        return
-    fi
-
-    hr
-    ok "重装已配置完成"
-    echo
-    warn "重要：${BOLD}现在系统还没有真正 DD${NC}"
-    warn "只有重启后，机器会从安装介质引导，那一刻才开始擦盘重装"
-    warn "重启后 5-15 分钟内不要操作，等装完用 root + 新密码、端口 ${newport} 重连"
-    echo
-    if confirm "现在立即重启开始 DD？" N; then
-        msg "3 秒后重启..."
-        sleep 3
-        reboot
-    else
-        warn "已取消重启。需要时手动执行: ${BOLD}reboot${NC}"
-        pause
-    fi
 }
 
 # =============================================================================

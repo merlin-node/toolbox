@@ -1944,12 +1944,46 @@ ssh_change_root_pw() {
     passwd root
 }
 
+# ---------- SSH 通用工具 ----------
+# 确保 sshd_config 会读取 sshd_config.d（部分 LXC 模板没有这一行，drop-in 会被无视）
+ssh_ensure_include() {
+    mkdir -p /etc/ssh/sshd_config.d
+    if ! grep -qE '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/' /etc/ssh/sshd_config; then
+        cp -a /etc/ssh/sshd_config "/etc/ssh/sshd_config.bak.$(date +%s)"
+        sed -i '1i Include /etc/ssh/sshd_config.d/*.conf' /etc/ssh/sshd_config
+        msg "已在 sshd_config 顶部补上 Include"
+    fi
+    # 旧版本用 99- 前缀，sshd 是「先读到的生效」，99 会被 50-cloud-init 等覆盖，迁移成 00-
+    local f
+    for f in /etc/ssh/sshd_config.d/99-tb-*.conf; do
+        [[ -e "$f" ]] && mv -f "$f" "/etc/ssh/sshd_config.d/00-${f##*/99-}"
+    done
+}
+
+# 是否由 systemd socket 激活（Ubuntu 22.10+ 默认，端口由 ssh.socket 决定，而不是 sshd_config）
+ssh_is_socket_mode() {
+    systemctl is-enabled --quiet ssh.socket 2>/dev/null || systemctl is-active --quiet ssh.socket 2>/dev/null
+}
+
+# 重启 SSH，兼容 ssh / sshd 服务名和 socket 激活
+ssh_restart() {
+    if ssh_is_socket_mode; then
+        systemctl daemon-reload
+        systemctl restart ssh.socket
+    elif systemctl list-unit-files ssh.service >/dev/null 2>&1 && systemctl cat ssh.service >/dev/null 2>&1; then
+        systemctl restart ssh
+    else
+        systemctl restart sshd
+    fi
+}
+
 ssh_change_port() {
     clear; show_banner
     sec "修改 SSH 端口"
-    local cur new
-    cur=$(sshd -T 2>/dev/null | awk '/^port /{print $2}' | head -1)
+    local cur new f
+    cur=$(sshd -T 2>/dev/null | awk '/^port /{print $2}' | xargs)
     echo -e "  当前端口: ${YELLOW}${cur:-22}${NC}"
+    ssh_is_socket_mode && echo -e "  启动方式: ${YELLOW}ssh.socket（socket 激活）${NC}"
     read -rp "$(echo -e "${CYAN}新端口 (1-65535，建议 10000+): ${NC}")" new
     [[ -z "$new" ]] && return
     if ! [[ "$new" =~ ^[0-9]+$ ]] || (( new < 1 || new > 65535 )); then
@@ -1958,19 +1992,52 @@ ssh_change_port() {
     if ss -tlnp 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${new}$"; then
         err "端口 $new 已被占用"; return
     fi
-    # 写入 drop-in
-    mkdir -p /etc/ssh/sshd_config.d
-    cat > /etc/ssh/sshd_config.d/99-tb-port.conf << EOF
-Port $new
-EOF
-    if sshd -t 2>&1; then
-        systemctl restart ssh
-        ok "SSH 端口已改为 $new"
-        warn "下次登录用新端口！当前连接保留，谨慎断开前先用新端口测试一下"
-    else
-        rm -f /etc/ssh/sshd_config.d/99-tb-port.conf
-        err "sshd 配置校验失败，已回滚"
+
+    ssh_ensure_include
+    local bak="/root/.tb-ssh-bak.$(date +%s)"
+    mkdir -p "$bak"
+    cp -a /etc/ssh/sshd_config /etc/ssh/sshd_config.d "$bak"/ 2>/dev/null
+
+    # 1) Port 可以写多行且「累加」，所以要把其它地方的 Port 注释掉，否则 22 会一直在
+    for f in /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf; do
+        [[ -f "$f" ]] && sed -i -E 's/^[[:space:]]*Port[[:space:]]+/#tb# Port /' "$f"
+    done
+    echo "Port $new" > /etc/ssh/sshd_config.d/00-tb-port.conf
+
+    if ! sshd -t 2>&1; then
+        cp -a "$bak/sshd_config" /etc/ssh/sshd_config
+        rm -rf /etc/ssh/sshd_config.d && cp -a "$bak/sshd_config.d" /etc/ssh/
+        err "sshd 配置校验失败，已回滚"; return
     fi
+
+    # 2) socket 激活模式：真正监听端口的是 ssh.socket，要单独覆盖
+    if ssh_is_socket_mode; then
+        mkdir -p /etc/systemd/system/ssh.socket.d
+        cat > /etc/systemd/system/ssh.socket.d/zz-tb-port.conf << SOCK
+[Socket]
+ListenStream=
+ListenStream=0.0.0.0:$new
+ListenStream=[::]:$new
+SOCK
+    fi
+
+    # 3) 防火墙放行
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+        ufw allow "$new"/tcp >/dev/null && msg "ufw 已放行 $new/tcp"
+    fi
+
+    ssh_restart
+    sleep 1
+    if ss -tln | awk '{print $4}' | grep -qE "[:.]${new}$"; then
+        ok "SSH 已在端口 $new 监听"
+    else
+        err "端口 $new 没有监听，请检查: systemctl status ssh ssh.socket"
+    fi
+    if ss -tln | awk '{print $4}' | grep -qE "[:.]22$" && (( new != 22 )); then
+        warn "22 端口仍在监听（可能是 sshd_config.d 以外的配置或别的服务）"
+    fi
+    warn "当前连接不会断。先另开一个终端用新端口登录成功，再关掉这个窗口！"
+    echo "  配置备份: $bak"
 }
 
 ssh_setup_key() {
@@ -1980,33 +2047,41 @@ ssh_setup_key() {
     local key
     read -r key
     [[ -z "$key" ]] && { warn "已取消"; return; }
-    if ! echo "$key" | grep -qE '^(ssh-rsa|ssh-ed25519|ecdsa-sha2-)'; then
+    if ! echo "$key" | grep -qE '^(ssh-rsa|ssh-ed25519|ecdsa-sha2-|sk-ssh-ed25519@|sk-ecdsa-sha2-)'; then
         err "公钥格式不对"
         return
     fi
-    mkdir -p ~/.ssh
-    chmod 700 ~/.ssh
-    touch ~/.ssh/authorized_keys
-    chmod 600 ~/.ssh/authorized_keys
-    if grep -qF "$key" ~/.ssh/authorized_keys; then
+    mkdir -p /root/.ssh
+    chmod 700 /root/.ssh
+    touch /root/.ssh/authorized_keys
+    chmod 600 /root/.ssh/authorized_keys
+    chown -R root:root /root/.ssh
+    if grep -qxF "$key" /root/.ssh/authorized_keys; then
         warn "这把公钥已存在"
     else
-        echo "$key" >> ~/.ssh/authorized_keys
-        ok "公钥已添加到 ~/.ssh/authorized_keys"
+        # 文件末尾没换行时补一个，避免和上一把钥匙粘在一行
+        [[ -s /root/.ssh/authorized_keys && -n "$(tail -c1 /root/.ssh/authorized_keys)" ]] && echo >> /root/.ssh/authorized_keys
+        echo "$key" >> /root/.ssh/authorized_keys
+        ok "公钥已添加到 /root/.ssh/authorized_keys"
     fi
-    # 启用密钥登录
-    mkdir -p /etc/ssh/sshd_config.d
-    cat > /etc/ssh/sshd_config.d/99-tb-key.conf << 'EOF'
+
+    ssh_ensure_include
+    cat > /etc/ssh/sshd_config.d/00-tb-key.conf << 'CONF'
 PubkeyAuthentication yes
 AuthorizedKeysFile .ssh/authorized_keys
-EOF
-    if sshd -t; then
-        systemctl restart ssh
-        ok "密钥登录已启用"
-        warn "强烈建议：在新终端测试密钥登录能成功后，再禁用密码登录"
-    else
-        err "sshd 配置校验失败"
+CONF
+    if ! sshd -t; then
+        rm -f /etc/ssh/sshd_config.d/00-tb-key.conf
+        err "sshd 配置校验失败，已回滚"; return
     fi
+    ssh_restart
+    # 校验最终生效值
+    local pk rl
+    pk=$(sshd -T 2>/dev/null | awk '/^pubkeyauthentication /{print $2}')
+    rl=$(sshd -T 2>/dev/null | awk '/^permitrootlogin /{print $2}')
+    [[ "$pk" == "yes" ]] && ok "密钥登录已启用" || err "pubkeyauthentication 实际为 $pk，被别的配置覆盖了"
+    [[ "$rl" == "no" ]] && warn "PermitRootLogin 为 no，root 用密钥也登不上"
+    warn "强烈建议：在新终端测试密钥登录能成功后，再禁用密码登录"
 }
 
 ssh_disable_root_password() {
@@ -2017,18 +2092,24 @@ ssh_disable_root_password() {
     echo "  2) 已经创建了 sudo 用户并且可以用密钥/密码登录"
     echo
     confirm "确认继续？" N || return
-    mkdir -p /etc/ssh/sshd_config.d
-    cat > /etc/ssh/sshd_config.d/99-tb-noroot.conf << 'EOF'
+    ssh_ensure_include
+    cat > /etc/ssh/sshd_config.d/00-tb-noroot.conf << 'CONF'
 PermitRootLogin prohibit-password
 PasswordAuthentication no
-EOF
-    if sshd -t; then
-        systemctl restart ssh
+KbdInteractiveAuthentication no
+CONF
+    if ! sshd -t; then
+        rm -f /etc/ssh/sshd_config.d/00-tb-noroot.conf
+        err "sshd 配置校验失败，已回滚"; return
+    fi
+    ssh_restart
+    local pa
+    pa=$(sshd -T 2>/dev/null | awk '/^passwordauthentication /{print $2}')
+    if [[ "$pa" == "no" ]]; then
         ok "已禁用 root 密码登录 + 全局密码登录"
         warn "现在 SSH 只能用密钥登录"
     else
-        rm -f /etc/ssh/sshd_config.d/99-tb-noroot.conf
-        err "sshd 配置校验失败，已回滚"
+        err "passwordauthentication 实际仍为 $pa，请检查 /etc/ssh/sshd_config.d/ 里的其它文件"
     fi
 }
 

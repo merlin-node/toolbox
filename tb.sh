@@ -1965,16 +1965,20 @@ ssh_is_socket_mode() {
     systemctl is-enabled --quiet ssh.socket 2>/dev/null || systemctl is-active --quiet ssh.socket 2>/dev/null
 }
 
-# 重启 SSH，兼容 ssh / sshd 服务名和 socket 激活
+# 重启 SSH，兼容 ssh / sshd 服务名
+# socket 激活模式下，ssh.socket 起的 sshd 会一直占着旧端口、导致 socket 无法重启，
+# 所以统一切换成独立的 ssh.service，让 sshd 直接读 sshd_config 里的 Port
 ssh_restart() {
+    local svc=ssh
+    systemctl cat ssh.service >/dev/null 2>&1 || svc=sshd
     if ssh_is_socket_mode; then
+        msg "检测到 ssh.socket，切换为独立的 ${svc}.service"
+        rm -f /etc/systemd/system/ssh.socket.d/zz-tb-port.conf
         systemctl daemon-reload
-        systemctl restart ssh.socket
-    elif systemctl list-unit-files ssh.service >/dev/null 2>&1 && systemctl cat ssh.service >/dev/null 2>&1; then
-        systemctl restart ssh
-    else
-        systemctl restart sshd
+        systemctl disable --now ssh.socket >/dev/null 2>&1
+        systemctl enable "$svc" >/dev/null 2>&1
     fi
+    systemctl restart "$svc"
 }
 
 ssh_change_port() {
@@ -1983,11 +1987,14 @@ ssh_change_port() {
     local cur new f
     cur=$(sshd -T 2>/dev/null | awk '/^port /{print $2}' | xargs)
     echo -e "  当前端口: ${YELLOW}${cur:-22}${NC}"
-    ssh_is_socket_mode && echo -e "  启动方式: ${YELLOW}ssh.socket（socket 激活）${NC}"
+    ssh_is_socket_mode && echo -e "  启动方式: ${YELLOW}ssh.socket（修改时会切换为 ssh.service）${NC}"
     read -rp "$(echo -e "${CYAN}新端口 (1-65535，建议 10000+): ${NC}")" new
     [[ -z "$new" ]] && return
     if ! [[ "$new" =~ ^[0-9]+$ ]] || (( new < 1 || new > 65535 )); then
         err "无效端口"; return
+    fi
+    if [[ " $cur " == *" $new "* ]]; then
+        ok "SSH 已经在端口 $new 上了，无需修改"; return
     fi
     if ss -tlnp 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${new}$"; then
         err "端口 $new 已被占用"; return
@@ -2010,23 +2017,18 @@ ssh_change_port() {
         err "sshd 配置校验失败，已回滚"; return
     fi
 
-    # 2) socket 激活模式：真正监听端口的是 ssh.socket，要单独覆盖
-    if ssh_is_socket_mode; then
-        mkdir -p /etc/systemd/system/ssh.socket.d
-        cat > /etc/systemd/system/ssh.socket.d/zz-tb-port.conf << SOCK
-[Socket]
-ListenStream=
-ListenStream=0.0.0.0:$new
-ListenStream=[::]:$new
-SOCK
-    fi
-
     # 3) 防火墙放行
     if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
         ufw allow "$new"/tcp >/dev/null && msg "ufw 已放行 $new/tcp"
     fi
 
-    ssh_restart
+    if ! ssh_restart; then
+        err "SSH 重启失败，回滚配置并恢复原来的启动方式"
+        cp -a "$bak/sshd_config" /etc/ssh/sshd_config
+        rm -rf /etc/ssh/sshd_config.d && cp -a "$bak/sshd_config.d" /etc/ssh/
+        systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || systemctl start ssh.socket
+        return
+    fi
     sleep 1
     if ss -tln | awk '{print $4}' | grep -qE "[:.]${new}$"; then
         ok "SSH 已在端口 $new 监听"

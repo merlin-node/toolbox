@@ -125,21 +125,40 @@ sys_update_clean() {
     sec "系统更新清理"
     msg "更新软件源..."
     apt-get update -y
-    msg "升级已安装包..."
-    apt-get upgrade -y
-    msg "清理无用依赖..."
+    # 确保内核元包在（linux-image-amd64 / linux-image-cloud-amd64 等）
+    # 没有它，apt 永远不会给你装新内核，安全补丁也就到不了
+    local flavor meta
+    flavor=$(uname -r | grep -oE '(cloud-|rt-)?(amd64|arm64|i386|686-pae|686)$' || dpkg --print-architecture)   # 6.1.0-27-cloud-amd64 / 6.12.48+deb13-cloud-amd64 -> cloud-amd64
+    meta="linux-image-${flavor}"
+    if ! dpkg -s "$meta" >/dev/null 2>&1; then
+        warn "未安装内核元包 ${meta}，补装..."
+        apt-get install -y "$meta" || warn "${meta} 安装失败，请手动检查"
+    fi
+    msg "升级已安装包（含新内核）..."
+    # 内核安全更新常常换 ABI 包名，upgrade 会把它 kept back，必须 full-upgrade
+    apt-get full-upgrade -y
+    msg "清理无用依赖和旧内核..."
+    # Debian 的 autoremove 会自动保留「正在运行的 + 最新的」内核，不用手动 purge
     apt-get autoremove --purge -y
     msg "清理 apt 缓存..."
     apt-get clean
     msg "清理 journal 日志（保留 7 天）..."
     journalctl --vacuum-time=7d >/dev/null 2>&1 || true
-    msg "清理旧内核..."
-    local current
-    current=$(uname -r)
-    dpkg -l 'linux-image-*' 2>/dev/null | awk '/^ii/{print $2}' \
-        | grep -v "$current" | grep -v "linux-image-generic" \
-        | xargs -r apt-get purge -y 2>/dev/null || true
     ok "系统已更新并清理"
+
+    # 新内核装上了但没重启 = 漏洞还在
+    local running newest
+    running=$(uname -r)
+    newest=$(find /boot -maxdepth 1 -name 'vmlinuz-*' -printf '%f\n' 2>/dev/null \
+        | sed 's/^vmlinuz-//' | sort -V | tail -1)
+    if [[ -n "$newest" && "$newest" != "$running" ]]; then
+        echo
+        warn "已安装新内核 ${newest}，当前运行的仍是 ${running}"
+        warn "不重启的话内核补丁不会生效"
+        if confirm "现在重启?" N; then
+            reboot
+        fi
+    fi
     pause
 }
 
@@ -1298,6 +1317,40 @@ caddy_view_log() {
     journalctl -u caddy -n "$n" --no-pager | sed 's/^/  /'
 }
 
+# ----- MPTCP 缓解（CVE-2026-98432 等内核 MPTCP 漏洞）-----
+# Go 1.24+ 编译的 Caddy 默认用 MPTCP 监听，正好落在漏洞路径上。
+# 首选办法是升级内核并重启；这里是临时缓解。
+CADDY_MPTCP_DROPIN="/etc/systemd/system/caddy.service.d/10-no-mptcp.conf"
+MPTCP_SYSCTL_FILE="/etc/sysctl.d/99-no-mptcp.conf"
+
+mptcp_status_str() {
+    local k d
+    k=$(sysctl -n net.mptcp.enabled 2>/dev/null || echo "n/a")
+    [[ -f "$CADDY_MPTCP_DROPIN" ]] && d="caddy 已禁用" || d="caddy 未禁用"
+    echo "内核 mptcp=${k} / ${d}"
+}
+
+caddy_mptcp_toggle() {
+    if [[ -f "$CADDY_MPTCP_DROPIN" || -f "$MPTCP_SYSCTL_FILE" ]]; then
+        confirm "当前已禁用 MPTCP，要恢复吗?" N || return
+        rm -f "$CADDY_MPTCP_DROPIN" "$MPTCP_SYSCTL_FILE"
+        sysctl -w net.mptcp.enabled=1 >/dev/null 2>&1 || true
+        systemctl daemon-reload
+        systemctl restart caddy && ok "已恢复 MPTCP 并重启 Caddy"
+        return
+    fi
+    mkdir -p "$(dirname "$CADDY_MPTCP_DROPIN")"
+    cat > "$CADDY_MPTCP_DROPIN" << 'EOF2'
+[Service]
+Environment=GODEBUG=multipathtcp=0
+EOF2
+    echo 'net.mptcp.enabled = 0' > "$MPTCP_SYSCTL_FILE"
+    sysctl -w net.mptcp.enabled=0 >/dev/null 2>&1 || warn "当前内核没有 net.mptcp.enabled（可能未编译 MPTCP，也就不受影响）"
+    systemctl daemon-reload
+    systemctl restart caddy && ok "已禁用 MPTCP 并重启 Caddy"
+    warn "这只是临时缓解，仍请在「系统更新清理」里升级内核并重启"
+}
+
 caddy_menu_service() {
     while :; do
         clear; show_banner
@@ -1308,6 +1361,7 @@ caddy_menu_service() {
         systemctl is-enabled --quiet caddy 2>/dev/null && enabled="${GREEN}开机自启${NC}"
         ver=$(caddy_version_str)
         echo -e "  状态: ${active}    自启: ${enabled}    版本: ${ver:-未知}"
+        echo -e "  MPTCP: $(mptcp_status_str)"
         hr
         echo "  1) 启动 Caddy"
         echo "  2) 停止 Caddy"
@@ -1317,10 +1371,11 @@ caddy_menu_service() {
         echo "  6) 实时跟踪 systemd 日志 (Ctrl+C 退出)"
         echo "  7) 更新 Caddy 到最新版"
         echo "  8) 卸载 Caddy"
+        echo "  9) 禁用/恢复 MPTCP（内核漏洞临时缓解）"
         echo "  0) 返回上一页"
         hr
         local c
-        read -rp "$(echo -e "${CYAN}请选择 [0-8]: ${NC}")" c
+        read -rp "$(echo -e "${CYAN}请选择 [0-9]: ${NC}")" c
         case "$c" in
             1) systemctl start caddy && ok "已启动"; sleep 1 ;;
             2) systemctl stop caddy && ok "已停止"; sleep 1 ;;
@@ -1333,6 +1388,7 @@ caddy_menu_service() {
                ok "Caddy 已更新至 $(caddy_version_str)"
                pause ;;
             8) caddy_uninstall; pause; return ;;
+            9) caddy_mptcp_toggle; pause ;;
             0|"") return ;;
             *) err "无效"; sleep 1 ;;
         esac
